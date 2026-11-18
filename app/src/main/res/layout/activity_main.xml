@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical">
+
+        <LinearLayout
+            android:id="@+id/toolbar"
+            android:layout_width="match_parent"
+            android:layout_height="56dp"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:background="#202124"
+            android:paddingLeft="12dp"
+            android:paddingRight="12dp">
+
+            <TextView android:id="@+id/btnBack" style="@style/TbBtn" android:text="Back" />
+            <TextView android:id="@+id/btnFwd" style="@style/TbBtn" android:text="Fwd" />
+            <TextView android:id="@+id/btnReload" style="@style/TbBtn" android:text="Reload" />
+            <TextView android:id="@+id/btnHome" style="@style/TbBtn" android:text="Home" />
+
+            <EditText
+                android:id="@+id/urlBar"
+                android:layout_width="0dp"
+                android:layout_height="40dp"
+                android:layout_weight="1"
+                android:layout_marginLeft="8dp"
+                android:layout_marginRight="8dp"
+                android:paddingLeft="12dp"
+                android:paddingRight="12dp"
+                android:background="#303134"
+                android:hint="Search or enter address"
+                android:textColor="#FFFFFF"
+                android:textColorHint="#9AA0A6"
+                android:textSize="16sp"
+                android:singleLine="true"
+                android:selectAllOnFocus="true"
+                android:inputType="textUri"
+                android:imeOptions="actionGo" />
+
+            <TextView android:id="@+id/btnShield" style="@style/TbBtn" android:text="Ads: ON" />
+        </LinearLayout>
+
+        <ProgressBar
+            android:id="@+id/progress"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="3dp"
+            android:max="100"
+            android:visibility="gone" />
+
+        <WebView
+            android:id="@+id/web"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:focusable="true" />
+    </LinearLayout>
+
+    <com.tvbrowser.CursorView
+        android:id="@+id/cursor"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+</FrameLayout>

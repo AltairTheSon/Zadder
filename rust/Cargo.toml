@@ -1,0 +1,18 @@
+[package]
+name = "adblock-jni"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "adblock_jni"
+crate-type = ["cdylib"]
+
+[dependencies]
+adblock = "0.9"
+jni = "0.21"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
