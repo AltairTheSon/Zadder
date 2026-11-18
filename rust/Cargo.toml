@@ -10,6 +10,7 @@ crate-type = ["cdylib"]
 [dependencies]
 adblock = "0.9"
 jni = "0.21"
+rmp = "=0.8.10"
 
 [profile.release]
 opt-level = "s"
