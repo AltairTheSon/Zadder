@@ -31,8 +31,6 @@ object AdBlock {
         "ublock-privacy.txt" to "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/privacy.txt",
         "ublock-badware.txt" to "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/badware.txt",
         "ublock-abuse.txt" to "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/resource-abuse.txt",
-        "fanboy-annoyance.txt" to "https://easylist.to/easylist/fanboy-annoyance.txt",
-        "adguard-base.txt" to "https://filters.adtidy.org/extension/ublock/filters/2_without_easylist.txt",
         "adguard-tracking.txt" to "https://filters.adtidy.org/extension/ublock/filters/3.txt",
     )
 
@@ -82,18 +80,21 @@ object AdBlock {
         loading = true
         ready = false
         Thread {
+            var ok = false
             try {
                 onStatus("Loading $set ad-block lists...")
                 val dir = File(ctx.filesDir, "filters").apply { mkdirs() }
-                val sb = StringBuilder()
+                val sb = StringBuilder(4_000_000)
                 val lists = if (set == "aggressive") CORE + EXTRA else CORE
                 for ((name, url) in lists) {
                     val f = File(dir, name)
                     if (!f.exists() || System.currentTimeMillis() - f.lastModified() > MAX_AGE_MS) download(url, f)
-                    if (f.exists()) sb.append(f.readText()).append('\n')
+                    if (f.exists()) appendFiltered(f, sb)
                 }
                 sb.append(CUSTOM).append('\n')
-                val ok = nativeLoad(sb.toString())
+                val text = sb.toString()
+                sb.setLength(0)
+                ok = nativeLoad(text)
                 if (ok) loadedSet = set
                 ready = ok
                 onStatus(if (ok) "Ad blocker ready ($set)" else "Ad blocker failed to load")
@@ -102,9 +103,27 @@ object AdBlock {
             } finally {
                 loading = false
             }
-            // The mode may have been switched while we were loading.
-            if (mode != Mode.OFF && wanted() != loadedSet) ensureLoaded(ctx, onStatus)
+            // The mode may have been switched while we were loading (never retry after a failure).
+            if (ok && mode != Mode.OFF && wanted() != loadedSet) ensureLoaded(ctx, onStatus)
         }.apply { name = "adblock-init"; start() }
+    }
+
+    /**
+     * Copies a filter list, dropping what this browser never uses so the engine stays small:
+     * comments, generic (site-independent) element-hiding rules and scriptlet rules.
+     */
+    private fun appendFiltered(f: File, sb: StringBuilder) {
+        f.useLines { lines ->
+            for (line in lines) {
+                if (line.isEmpty()) continue
+                val c = line[0]
+                if (c == '!' || c == '[') continue
+                if (line.startsWith("##") || line.startsWith("#@#") || line.startsWith("#?#") ||
+                    line.startsWith("#\$#") || line.startsWith("#%#")) continue
+                if (line.contains("+js(") || line.contains("#%#") || line.contains("#@%#")) continue
+                sb.append(line).append('\n')
+            }
+        }
     }
 
     private fun download(url: String, dest: File) {

@@ -30,6 +30,7 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
+import android.webkit.WebResourceError
 import android.webkit.WebViewClient
 import android.widget.EditText
 import android.widget.FrameLayout
@@ -42,10 +43,14 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.net.URLEncoder
+import java.util.concurrent.Executors
+
+const val HOME_URL = "https://tvbrowser.home/"
 
 class Tab(val web: WebView) {
     @Volatile var pageUrl = ""
     var chainOk = true   // true when the current navigation chain was started by the user
+    var lastCosmetic = ""
 }
 
 private class Row(val title: String, val sub: String, val onClick: () -> Unit, val onDelete: (() -> Unit)? = null)
@@ -66,7 +71,7 @@ class MainActivity : Activity() {
 
     private val prefs: SharedPreferences by lazy { getSharedPreferences("tvb", Context.MODE_PRIVATE) }
     private val ui = Handler(Looper.getMainLooper())
-    private val home = "https://search.brave.com/"
+    private val home = HOME_URL
     private var density = 1f
 
     private val tabs = ArrayList<Tab>()
@@ -85,6 +90,9 @@ class MainActivity : Activity() {
     private var savedY = 0f
     private val held = BooleanArray(4)          // up, down, left, right
     private val heldSince = LongArray(4)
+    private val lastBeat = LongArray(4)
+    private var lastBack = 0L
+    private val bg = Executors.newSingleThreadExecutor()
     private var looping = false
     private var lastFrame = 0L
     private var remX = 0f
@@ -177,8 +185,15 @@ class MainActivity : Activity() {
 
         w.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
-                if (request == null || request.isForMainFrame) return null
+                if (request == null) return null
                 val url = request.url.toString()
+                if (isHome(url)) {
+                    return if (request.isForMainFrame)
+                        WebResourceResponse("text/html", "utf-8", ByteArrayInputStream(homeHtml().toByteArray(Charsets.UTF_8)))
+                    else
+                        WebResourceResponse("text/plain", "utf-8", 404, "Not Found", null, ByteArrayInputStream(ByteArray(0)))
+                }
+                if (request.isForMainFrame) return null
                 if (!url.startsWith("http")) return null
                 val source = t.pageUrl.ifEmpty { url }
                 return if (AdBlock.shouldBlock(url, source, guessType(request)))
@@ -198,11 +213,16 @@ class MainActivity : Activity() {
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 t.pageUrl = url ?: ""
+                t.lastCosmetic = ""
                 if (t === tab) {
-                    if (!urlBar.hasFocus()) urlBar.setText(url)
+                    if (!urlBar.hasFocus()) urlBar.setText(if (isHome(t.pageUrl)) "" else t.pageUrl)
                     progress.visibility = View.VISIBLE
                     updateFavButton()
                 }
+            }
+
+            override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                if (request != null && request.isForMainFrame && isHome(request.url.toString())) ui.post { t.web.loadUrl(home) }
             }
 
             override fun onPageCommitVisible(view: WebView?, url: String?) { injectBridge(t); injectCosmetic(t, url) }
@@ -282,7 +302,7 @@ class MainActivity : Activity() {
         cur = i
         for ((idx, t) in tabs.withIndex()) t.web.visibility = if (idx == i) View.VISIBLE else View.GONE
         web.requestFocus()
-        if (!urlBar.hasFocus()) urlBar.setText(tab.pageUrl)
+        if (!urlBar.hasFocus()) urlBar.setText(if (isHome(tab.pageUrl)) "" else tab.pageUrl)
         progress.visibility = View.GONE
         updateTabsLabel()
         updateFavButton()
@@ -300,6 +320,47 @@ class MainActivity : Activity() {
     private fun updateTabsLabel() { btnTabs.text = "Tabs (${tabs.size})" }
 
     // ---------------------------------------------------------------- ad / redirect policy
+
+    private fun isHome(url: String) = url.startsWith("https://tvbrowser.home")
+
+    private fun homeHtml(): String {
+        val colors = arrayOf("#e8710a", "#1a73e8", "#188038", "#a142f4", "#d93025", "#12b5cb")
+        val sb = StringBuilder()
+        sb.append("<!doctype html><html><head><meta charset='utf-8'><title>Home</title><style>")
+        sb.append("body{margin:0;background:#101114;color:#fff;font-family:sans-serif}")
+        sb.append(".w{max-width:900px;margin:0 auto;padding:36px 20px}")
+        sb.append("form{margin:0 0 32px}")
+        sb.append("input{width:100%;box-sizing:border-box;padding:16px 22px;font-size:26px;border-radius:32px;border:0;background:#2a2b2f;color:#fff}")
+        sb.append("h2{font-size:22px;color:#9aa0a6;font-weight:normal;margin:0 0 16px}")
+        sb.append(".g{display:flex;flex-wrap:wrap;gap:18px}")
+        sb.append(".t{display:block;width:200px;padding:18px 10px;background:#1e1f23;border-radius:14px;text-align:center;color:#fff;text-decoration:none}")
+        sb.append(".i{width:64px;height:64px;line-height:64px;border-radius:50%;margin:0 auto 10px;font-size:30px;font-weight:bold}")
+        sb.append(".n{font-size:18px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}")
+        sb.append(".h{color:#9aa0a6;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}")
+        sb.append(".e{color:#9aa0a6;font-size:20px;line-height:1.5}")
+        sb.append("</style></head><body><div class='w'>")
+        sb.append("<form action='https://search.brave.com/search' method='get'>")
+        sb.append("<input name='q' placeholder='Search with Brave' autocomplete='off'></form>")
+        sb.append("<h2>Favorites</h2>")
+        val list = favs()
+        if (list.isEmpty()) {
+            sb.append("<div class='e'>No favorites yet.<br>Open any site and choose <b>+ Fav</b> in the toolbar to pin it here.</div>")
+        } else {
+            sb.append("<div class='g'>")
+            for ((i, f) in list.withIndex()) {
+                val host = try { Uri.parse(f.second).host ?: f.second } catch (e: Exception) { f.second }
+                val letter = (f.first.trim().firstOrNull() ?: '?').uppercaseChar().toString()
+                sb.append("<a class='t' href='").append(TextUtils.htmlEncode(f.second)).append("'>")
+                sb.append("<div class='i' style='background:").append(colors[i % colors.size]).append("'>")
+                    .append(TextUtils.htmlEncode(letter)).append("</div>")
+                sb.append("<div class='n'>").append(TextUtils.htmlEncode(f.first)).append("</div>")
+                sb.append("<div class='h'>").append(TextUtils.htmlEncode(host)).append("</div></a>")
+            }
+            sb.append("</div>")
+        }
+        sb.append("</div></body></html>")
+        return sb.toString()
+    }
 
     private fun recentTap() = SystemClock.uptimeMillis() - lastTap < 3000
 
@@ -330,6 +391,7 @@ class MainActivity : Activity() {
      */
     private fun blockNavigation(t: Tab, req: WebResourceRequest): Boolean {
         val target = req.url.toString()
+        if (isHome(t.pageUrl)) { t.chainOk = true; return false }   // tapping a favorite / using the search box
         if (AdBlock.shouldBlockNavigation(target, t.pageUrl)) { notifyBlocked("Blocked ad redirect"); return true }
         val cross = isCrossSite(t.pageUrl, target)
         if (req.isRedirect) {
@@ -362,23 +424,33 @@ class MainActivity : Activity() {
     }
 
     private fun injectBridge(t: Tab) {
-        t.web.evaluateJavascript(
-            "(function(){if(window.__tvb)return;window.__tvb=1;" +
-                "function f(e){var n=e.target,a=n&&n.closest?n.closest('a[href]'):null;TVB.tap(a?a.href:'');}" +
-                "document.addEventListener('pointerdown',f,true);document.addEventListener('click',f,true);})();",
-            null
-        )
+        try {
+            t.web.evaluateJavascript(
+                "(function(){if(window.__tvb)return;window.__tvb=1;" +
+                    "function f(e){var n=e.target,a=n&&n.closest?n.closest('a[href]'):null;TVB.tap(a?a.href:'');}" +
+                    "document.addEventListener('pointerdown',f,true);document.addEventListener('click',f,true);})();",
+                null
+            )
+        } catch (e: Exception) { }
     }
 
+    /** Looks the hide-rules up on a background thread (they can be slow) and injects them on the UI thread. */
     private fun injectCosmetic(t: Tab, url: String?) {
-        if (url == null || !url.startsWith("http")) return
-        val css = AdBlock.cosmeticCss(url)
-        if (css.isEmpty()) return
-        val js = "(function(){try{var s=document.querySelector('style[data-tvb]');" +
-            "if(!s){s=document.createElement('style');s.setAttribute('data-tvb','1');" +
-            "(document.head||document.documentElement).appendChild(s);}" +
-            "s.textContent=" + JSONObject.quote(css) + ";}catch(e){}})();"
-        t.web.evaluateJavascript(js, null)
+        if (url == null || !url.startsWith("http") || isHome(url) || !AdBlock.enabled) return
+        if (t.lastCosmetic == url) return
+        t.lastCosmetic = url
+        bg.execute {
+            val css = AdBlock.cosmeticCss(url)
+            if (css.isNotEmpty()) {
+                val js = "(function(){try{var s=document.querySelector('style[data-tvb]');" +
+                    "if(!s){s=document.createElement('style');s.setAttribute('data-tvb','1');" +
+                    "(document.head||document.documentElement).appendChild(s);}" +
+                    "s.textContent=" + JSONObject.quote(css) + ";}catch(e){}})();"
+                runOnUiThread {
+                    if (tabs.contains(t)) try { t.web.evaluateJavascript(js, null) } catch (e: Exception) { }
+                }
+            }
+        }
     }
 
     private fun cycleShield() {
@@ -424,6 +496,7 @@ class MainActivity : Activity() {
     private fun toggleFav() {
         val u = tab.pageUrl
         if (!u.startsWith("http")) return
+        if (isHome(u)) { toast("Open a site first, then choose + Fav"); return }
         val l = favs()
         if (l.any { it.second == u }) {
             l.removeAll { it.second == u }; toast("Removed from favorites")
@@ -441,7 +514,7 @@ class MainActivity : Activity() {
         val rows = ArrayList<Row>()
         for (f in favs()) {
             rows.add(Row(f.first, f.second, { hidePanel(); tab.chainOk = true; web.loadUrl(f.second) },
-                { saveFavs(favs().filter { it.second != f.second }); updateFavButton(); showFavs() }))
+                { saveFavs(favs().filter { it.second != f.second }); updateFavButton(); if (isHome(tab.pageUrl)) web.reload(); showFavs() }))
         }
         if (rows.isEmpty()) rows.add(Row("No favorites yet", "Open a page and choose + Fav in the toolbar", { }))
         showPanel("Favorites", rows)
@@ -449,10 +522,10 @@ class MainActivity : Activity() {
 
     private fun showTabs() {
         val rows = ArrayList<Row>()
-        rows.add(Row("+ New tab", "Opens Brave Search", { hidePanel(); newTab(home) }))
+        rows.add(Row("+ New tab", "Opens your favorites", { hidePanel(); newTab(home) }))
         for ((i, t) in tabs.withIndex()) {
             val name = t.web.title?.takeIf { it.isNotBlank() } ?: t.pageUrl.ifEmpty { "New tab" }
-            rows.add(Row((if (i == cur) "> " else "") + name, t.pageUrl, { hidePanel(); switchTo(i) }, { closeTab(i); showTabs() }))
+            rows.add(Row((if (i == cur) "> " else "") + name, if (isHome(t.pageUrl)) "Favorites" else t.pageUrl, { hidePanel(); switchTo(i) }, { closeTab(i); showTabs() }))
         }
         showPanel("Tabs (${tabs.size})", rows)
     }
@@ -570,10 +643,11 @@ class MainActivity : Activity() {
         }
         if (idx >= 0) {
             if (down) {
-                if (e.repeatCount == 0 && !held[idx]) {
+                val now = SystemClock.uptimeMillis()
+                lastBeat[idx] = now
+                if (e.repeatCount == 0) {
+                    if (!held[idx]) heldSince[idx] = System.nanoTime()
                     held[idx] = true
-                    heldSince[idx] = System.nanoTime()
-                    val now = SystemClock.uptimeMillis()
                     if (idx == 0) { if (now - lastUp < 350 && !scrollMode) jumpToToolbar(); lastUp = now }
                     if (idx == 1) { if (now - lastDown < 350 && !scrollMode) returnFromToolbar(); lastDown = now }
                     startLoop()
@@ -605,6 +679,9 @@ class MainActivity : Activity() {
 
     private val frame = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
+            // Failsafe: if a key-up was ever lost, stop moving after 3 s without a key event.
+            val nowMs = SystemClock.uptimeMillis()
+            for (i in 0..3) if (held[i] && nowMs - lastBeat[i] > 3000) held[i] = false
             if (!held.any { it }) { looping = false; lastFrame = 0L; return }
             val dt = if (lastFrame == 0L) 0.016f else ((frameTimeNanos - lastFrame) / 1e9f).coerceAtMost(0.05f)
             lastFrame = frameTimeNanos
@@ -716,16 +793,28 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun showExitDialog() {
+        android.app.AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+            .setTitle("Exit TV Browser?")
+            .setPositiveButton("Exit") { _, _ -> finishAndRemoveTask() }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     @Suppress("OVERRIDE_DEPRECATION")
     override fun onBackPressed() {
+        if (customView != null) { hideCustom(); return }
+        if (panel != null) { hidePanel(); return }
+        if (urlBar.hasFocus()) { hideKeyboard(); web.requestFocus(); return }
+        if (scrollMode) { toggleScrollMode(); return }
+        // Two quick Back presses open the exit popup.
+        val now = SystemClock.uptimeMillis()
+        if (now - lastBack < 1500) { lastBack = 0L; showExitDialog(); return }
+        lastBack = now
         when {
-            customView != null -> hideCustom()
-            panel != null -> hidePanel()
-            urlBar.hasFocus() -> { hideKeyboard(); web.requestFocus() }
-            scrollMode -> toggleScrollMode()
             web.canGoBack() -> web.goBack()
             tabs.size > 1 -> closeTab(cur)
-            else -> super.onBackPressed()
+            else -> toast("Press Back again to exit")
         }
     }
 
@@ -736,5 +825,5 @@ class MainActivity : Activity() {
 
     override fun onResume() { super.onResume(); web.onResume(); ui.post(ticker) }
     override fun onPause() { held.fill(false); ui.removeCallbacks(ticker); web.onPause(); super.onPause() }
-    override fun onDestroy() { for (t in tabs) t.web.destroy(); super.onDestroy() }
+    override fun onDestroy() { bg.shutdown(); for (t in tabs) t.web.destroy(); super.onDestroy() }
 }

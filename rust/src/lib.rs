@@ -1,6 +1,7 @@
 //! JNI bridge to Brave's adblock-rust engine.
 //! The Engine lives on one dedicated worker thread (it is not guaranteed Send/Sync),
-//! and the JNI functions talk to it over channels.
+//! and the JNI functions talk to it over channels. A panic while handling one message
+//! is contained so it can never kill the worker or the app.
 
 use adblock::lists::{FilterSet, ParseOptions};
 use adblock::request::Request;
@@ -8,8 +9,10 @@ use adblock::Engine;
 use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jstring};
 use jni::JNIEnv;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 enum Msg {
     Load(String, Sender<bool>),
@@ -37,37 +40,44 @@ fn sender() -> Sender<Msg> {
 fn worker(rx: Receiver<Msg>) {
     let mut engine: Option<Engine> = None;
     while let Ok(msg) = rx.recv() {
-        match msg {
-            Msg::Load(rules, reply) => {
-                engine = None; // free the old engine first to keep peak memory low
-                let lines: Vec<String> = rules.lines().map(|s| s.to_string()).collect();
-                let mut set = FilterSet::new(false);
-                set.add_filters(&lines, ParseOptions::default());
-                engine = Some(Engine::from_filter_set(set, true));
-                let _ = reply.send(true);
-            }
-            Msg::Check(url, source, rtype, reply) => {
-                let blocked = match (&engine, Request::new(&url, &source, &rtype)) {
-                    (Some(e), Ok(req)) => e.check_network_request(&req).matched,
-                    _ => false,
-                };
-                let _ = reply.send(blocked);
-            }
-            Msg::Cosmetic(url, reply) => {
-                let css = match &engine {
-                    Some(e) => {
-                        let res = e.url_cosmetic_resources(&url);
-                        // One rule per selector so a single invalid selector can't break the rest.
-                        res.hide_selectors
-                            .iter()
-                            .take(4000)
-                            .map(|s| format!("{}{{display:none!important}}\n", s))
-                            .collect::<String>()
-                    }
-                    None => String::new(),
-                };
-                let _ = reply.send(css);
-            }
+        // If handling panics, the reply sender is dropped and the caller just gets "false"/"".
+        let _ = catch_unwind(AssertUnwindSafe(|| handle(&mut engine, msg)));
+    }
+}
+
+fn handle(engine: &mut Option<Engine>, msg: Msg) {
+    match msg {
+        Msg::Load(rules, reply) => {
+            *engine = None; // free the old engine first to keep peak memory low
+            let lines: Vec<String> = rules.lines().map(|s| s.to_string()).collect();
+            drop(rules);
+            let mut set = FilterSet::new(false);
+            set.add_filters(&lines, ParseOptions::default());
+            drop(lines);
+            *engine = Some(Engine::from_filter_set(set, true));
+            let _ = reply.send(true);
+        }
+        Msg::Check(url, source, rtype, reply) => {
+            let blocked = match (engine.as_ref(), Request::new(&url, &source, &rtype)) {
+                (Some(e), Ok(req)) => e.check_network_request(&req).matched,
+                _ => false,
+            };
+            let _ = reply.send(blocked);
+        }
+        Msg::Cosmetic(url, reply) => {
+            let css = match engine.as_ref() {
+                Some(e) => {
+                    let res = e.url_cosmetic_resources(&url);
+                    // One rule per selector so a single invalid selector can't break the rest.
+                    res.hide_selectors
+                        .iter()
+                        .take(1500)
+                        .map(|s| format!("{}{{display:none!important}}\n", s))
+                        .collect::<String>()
+                }
+                None => String::new(),
+            };
+            let _ = reply.send(css);
         }
     }
 }
@@ -105,7 +115,8 @@ pub extern "system" fn Java_com_tvbrowser_AdBlock_nativeShouldBlock(
     if sender().send(Msg::Check(u, s, t, tx)).is_err() {
         return 0;
     }
-    rx.recv().unwrap_or(false) as jboolean
+    // Never let a slow worker stall page loads for long.
+    rx.recv_timeout(Duration::from_millis(400)).unwrap_or(false) as jboolean
 }
 
 #[no_mangle]
@@ -119,6 +130,6 @@ pub extern "system" fn Java_com_tvbrowser_AdBlock_nativeCosmetic(
     if sender().send(Msg::Cosmetic(u, tx)).is_err() {
         return std::ptr::null_mut();
     }
-    let css = rx.recv().unwrap_or_default();
+    let css = rx.recv_timeout(Duration::from_millis(1000)).unwrap_or_default();
     env.new_string(css).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }

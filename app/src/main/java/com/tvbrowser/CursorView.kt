@@ -6,11 +6,13 @@ import android.graphics.Paint
 import android.util.AttributeSet
 import android.view.View
 
-/** Transparent overlay that draws the remote-controlled mouse pointer. */
+/**
+ * The remote-controlled mouse pointer. It is a small view that is moved with translationX/Y,
+ * so moving it never forces a repaint of the whole screen (much smoother on a TV box).
+ */
 class CursorView @JvmOverloads constructor(ctx: Context, attrs: AttributeSet? = null) : View(ctx, attrs) {
-    private var cx = 0f
-    private var cy = 0f
     private val d = resources.displayMetrics.density
+    private val size = (28 * d).toInt()
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xCCFFFFFF.toInt() }
     private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = 0xFF000000.toInt(); style = Paint.Style.STROKE; strokeWidth = 2.5f * d
@@ -18,10 +20,15 @@ class CursorView @JvmOverloads constructor(ctx: Context, attrs: AttributeSet? = 
 
     init { isClickable = false; isFocusable = false }
 
-    fun setPos(x: Float, y: Float) { cx = x; cy = y; invalidate() }
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) = setMeasuredDimension(size, size)
+
+    fun setPos(x: Float, y: Float) {
+        translationX = x - size / 2f
+        translationY = y - size / 2f
+    }
 
     override fun onDraw(c: Canvas) {
-        c.drawCircle(cx, cy, 9 * d, fill)
-        c.drawCircle(cx, cy, 9 * d, stroke)
+        c.drawCircle(size / 2f, size / 2f, 9 * d, fill)
+        c.drawCircle(size / 2f, size / 2f, 9 * d, stroke)
     }
 }
