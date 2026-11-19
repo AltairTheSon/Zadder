@@ -79,6 +79,15 @@ object AdBlock {
         return b
     }
 
+    /** For main-frame navigations and popups: true if the destination looks like an ad/redirect domain. */
+    fun shouldBlockNavigation(url: String, source: String): Boolean {
+        if (!enabled || !ready) return false
+        for (type in arrayOf("document", "subdocument", "popup")) {
+            if (nativeShouldBlock(url, source, type)) { blockedCount.incrementAndGet(); return true }
+        }
+        return false
+    }
+
     fun cosmeticCss(url: String): String {
         if (!enabled || !ready) return ""
         return nativeCosmetic(url) ?: ""

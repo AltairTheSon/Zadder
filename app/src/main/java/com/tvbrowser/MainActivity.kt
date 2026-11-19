@@ -7,7 +7,9 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.os.Bundle
 import android.os.Handler
+import android.net.Uri
 import android.os.Looper
+import android.os.Message
 import android.os.SystemClock
 import android.view.InputDevice
 import android.view.KeyEvent
@@ -40,7 +42,7 @@ class MainActivity : Activity() {
     private lateinit var shield: TextView
 
     private val ui = Handler(Looper.getMainLooper())
-    private val home = "https://duckduckgo.com/"
+    private val home = "https://search.brave.com/"
     private var density = 1f
     private var cursorX = 0f
     private var cursorY = 0f
@@ -49,6 +51,8 @@ class MainActivity : Activity() {
 
     @Volatile
     private var pageUrl = ""
+    private var lastTap = 0L
+    private var lastToast = 0L
 
     private val reScript = Regex(".*\\.m?js$")
     private val reImage = Regex(".*\\.(png|jpe?g|gif|webp|svg|ico|avif|bmp)$")
@@ -109,6 +113,8 @@ class MainActivity : Activity() {
         s.domStorageEnabled = true
         s.useWideViewPort = true
         s.loadWithOverviewMode = true
+        s.setSupportMultipleWindows(true)          // popups come to onCreateWindow so we can vet them
+        s.javaScriptCanOpenWindowsAutomatically = false  // scripts can't open windows without a tap
         // Ask sites for their desktop layout: it suits a 1080p TV better than the phone layout.
         val chrome = Regex("Chrome/([\\d.]+)").find(s.userAgentString)?.groupValues?.get(1) ?: "124.0.0.0"
         s.userAgentString =
@@ -126,8 +132,21 @@ class MainActivity : Activity() {
             }
 
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                val scheme = request?.url?.scheme ?: return false
-                return !(scheme == "http" || scheme == "https" || scheme == "about" || scheme == "data" || scheme == "blob")
+                val req = request ?: return false
+                val scheme = req.url.scheme ?: return false
+                if (scheme != "http" && scheme != "https") {
+                    return !(scheme == "about" || scheme == "data" || scheme == "blob")
+                }
+                if (!req.isForMainFrame || !AdBlock.enabled) return false
+                val target = req.url.toString()
+                // 1) destination is a known ad / redirect domain
+                if (AdBlock.shouldBlockNavigation(target, pageUrl)) { notifyBlocked("Blocked ad redirect"); return true }
+                // 2) page jumps to another site by itself, with no tap from the user
+                val tapped = req.hasGesture() || SystemClock.uptimeMillis() - lastTap < 2500
+                if (!tapped && !req.isRedirect && isCrossSite(pageUrl, target)) {
+                    notifyBlocked("Blocked automatic redirect"); return true
+                }
+                return false
             }
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
@@ -156,7 +175,59 @@ class MainActivity : Activity() {
             }
 
             override fun onHideCustomView() = hideCustom()
+
+            override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message?): Boolean {
+                val msg = resultMsg ?: return false
+                val transport = msg.obj as? WebView.WebViewTransport ?: return false
+                val popup = WebView(this@MainActivity)
+                var handled = false
+                fun handle(url: String?) {
+                    if (handled || url.isNullOrEmpty() || url == "about:blank") return
+                    handled = true
+                    ui.post {
+                        if (url.startsWith("http") && !AdBlock.shouldBlockNavigation(url, pageUrl)) web.loadUrl(url)
+                        else notifyBlocked("Blocked popup")
+                        popup.stopLoading(); popup.destroy()
+                    }
+                }
+                popup.webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(v: WebView?, r: WebResourceRequest?): Boolean {
+                        handle(r?.url?.toString()); return true
+                    }
+                    override fun shouldInterceptRequest(v: WebView?, r: WebResourceRequest?): WebResourceResponse? {
+                        if (r != null && r.isForMainFrame) {
+                            handle(r.url.toString())
+                            return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+                        }
+                        return null
+                    }
+                }
+                ui.postDelayed({ if (!handled) { handled = true; popup.destroy() } }, 10000)
+                transport.webView = popup
+                msg.sendToTarget()
+                return true
+            }
         }
+    }
+
+    private fun baseDomain(url: String): String {
+        val host = try { Uri.parse(url).host ?: "" } catch (e: Exception) { "" }
+        val parts = host.split('.')
+        return if (parts.size <= 2) host else parts.takeLast(2).joinToString(".")
+    }
+
+    private fun isCrossSite(from: String, to: String): Boolean {
+        if (from.isEmpty()) return false
+        val a = baseDomain(from)
+        val b = baseDomain(to)
+        return a.isNotEmpty() && b.isNotEmpty() && a != b
+    }
+
+    private fun notifyBlocked(text: String) {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastToast < 3000) return
+        lastToast = now
+        runOnUiThread { Toast.makeText(this, text, Toast.LENGTH_SHORT).show() }
     }
 
     private fun hideCustom() {
@@ -199,7 +270,7 @@ class MainActivity : Activity() {
         if (s.isEmpty()) return
         val url = when {
             s.startsWith("http://") || s.startsWith("https://") -> s
-            s.contains(" ") || !s.contains(".") -> "https://duckduckgo.com/?q=" + URLEncoder.encode(s, "UTF-8")
+            s.contains(" ") || !s.contains(".") -> "https://search.brave.com/search?q=" + URLEncoder.encode(s, "UTF-8")
             else -> "https://$s"
         }
         web.loadUrl(url)
@@ -260,6 +331,7 @@ class MainActivity : Activity() {
         val x = cursorX
         val y = cursorY
         val t = SystemClock.uptimeMillis()
+        lastTap = t
         val down = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, x, y, 0)
         down.source = InputDevice.SOURCE_TOUCHSCREEN
         root.dispatchTouchEvent(down)
