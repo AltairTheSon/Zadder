@@ -2,6 +2,8 @@ package com.tvbrowser
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.ActivityManager
+import android.app.ApplicationExitInfo
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
@@ -9,12 +11,14 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Typeface
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.Message
 import android.os.SystemClock
 import android.text.TextUtils
+import android.util.Log
 import android.view.Choreographer
 import android.view.Gravity
 import android.view.InputDevice
@@ -30,6 +34,7 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceError
 import android.webkit.WebViewClient
 import android.widget.EditText
@@ -47,7 +52,7 @@ import java.util.concurrent.Executors
 
 const val HOME_URL = "https://tvbrowser.home/"
 
-class Tab(val web: WebView) {
+class Tab(var web: WebView) {
     @Volatile var pageUrl = ""
     var chainOk = true   // true when the current navigation chain was started by the user
     var lastCosmetic = ""
@@ -136,7 +141,13 @@ class MainActivity : Activity() {
         btnTabs = findViewById(R.id.btnTabs)
         btnFav = findViewById(R.id.btnFav)
 
-        AdBlock.mode = AdBlock.Mode.values().getOrElse(prefs.getInt("mode", 2)) { AdBlock.Mode.AGGRESSIVE }
+        AdBlock.mode = AdBlock.Mode.values().getOrElse(prefs.getInt("mode", 1)) { AdBlock.Mode.STANDARD }
+
+        val prevHandler = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { th, ex ->
+            try { prefs.edit().putString("last_crash", Log.getStackTraceString(ex).take(1500)).commit() } catch (e: Throwable) { }
+            prevHandler?.uncaughtException(th, ex)
+        }
 
         findViewById<View>(R.id.btnBack).setOnClickListener { if (web.canGoBack()) web.goBack() }
         findViewById<View>(R.id.btnFwd).setOnClickListener { if (web.canGoForward()) web.goForward() }
@@ -163,6 +174,7 @@ class MainActivity : Activity() {
             cursor.setPos(cursorX, cursorY)
         }
         AdBlock.ensureLoaded(applicationContext, ::status)
+        ui.postDelayed({ reportLastProblem() }, 1500)
     }
 
     // ---------------------------------------------------------------- tabs
@@ -223,6 +235,11 @@ class MainActivity : Activity() {
 
             override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
                 if (request != null && request.isForMainFrame && isHome(request.url.toString())) ui.post { t.web.loadUrl(home) }
+            }
+
+            override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
+                ui.post { recoverTab(t) }
+                return true
             }
 
             override fun onPageCommitVisible(view: WebView?, url: String?) { injectBridge(t); injectCosmetic(t, url) }
@@ -315,6 +332,24 @@ class MainActivity : Activity() {
         t.web.destroy()
         if (cur >= tabs.size) cur = tabs.size - 1 else if (i < cur) cur--
         switchTo(cur)
+    }
+
+    /** The WebView's renderer process was killed (usually low memory): rebuild this tab instead of crashing. */
+    private fun recoverTab(t: Tab) {
+        val i = tabs.indexOf(t)
+        if (i < 0) return
+        webHolder.removeView(t.web)
+        try { t.web.destroy() } catch (e: Exception) { }
+        val w = WebView(this)
+        t.web = w
+        t.pageUrl = ""
+        t.chainOk = true
+        configure(w, t)
+        webHolder.addView(w, FrameLayout.LayoutParams(MATCH, MATCH))
+        w.visibility = if (i == cur) View.VISIBLE else View.GONE
+        w.loadUrl(home)
+        if (i == cur) w.requestFocus()
+        toast("The page ran out of memory and was reset")
     }
 
     private fun updateTabsLabel() { btnTabs.text = "Tabs (${tabs.size})" }
@@ -460,6 +495,7 @@ class MainActivity : Activity() {
             AdBlock.Mode.OFF -> AdBlock.Mode.AGGRESSIVE
         }
         prefs.edit().putInt("mode", AdBlock.mode.ordinal).apply()
+        AdBlock.resetFailure(applicationContext)
         AdBlock.ensureLoaded(applicationContext, ::status)
         toast("Shield: " + AdBlock.mode.name.lowercase())
         updateShield()
@@ -622,6 +658,50 @@ class MainActivity : Activity() {
         }
         tab.chainOk = true
         web.loadUrl(url)
+    }
+
+    private fun showInfo(title: String, text: String) {
+        android.app.AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+            .setTitle(title).setMessage(text).setPositiveButton("OK", null).show()
+    }
+
+    /** After a crash or a system kill, tell the user why (this also tells me what to fix). */
+    private fun reportLastProblem() {
+        val saved = prefs.getString("last_crash", null)
+        if (saved != null) {
+            prefs.edit().remove("last_crash").apply()
+            showInfo("The app crashed last time", saved)
+            return
+        }
+        if (Build.VERSION.SDK_INT < 30) return
+        try {
+            val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val last = am.getHistoricalProcessExitReasons(packageName, 0, 1).firstOrNull() ?: return
+            if (last.timestamp <= prefs.getLong("exit_seen", 0L)) return
+            prefs.edit().putLong("exit_seen", last.timestamp).apply()
+            val name = when (last.reason) {
+                ApplicationExitInfo.REASON_LOW_MEMORY -> "the system killed it (low memory)"
+                ApplicationExitInfo.REASON_CRASH -> "it crashed"
+                ApplicationExitInfo.REASON_CRASH_NATIVE -> "it crashed (native code)"
+                ApplicationExitInfo.REASON_ANR -> "it stopped responding (ANR)"
+                ApplicationExitInfo.REASON_SIGNALED -> "the system stopped it"
+                ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> "it used too many resources"
+                else -> return
+            }
+            var text = (last.description ?: "") + "\nMemory used: " + (last.rss / 1024) + " MB"
+            if (last.reason == ApplicationExitInfo.REASON_ANR) {
+                try {
+                    val trace = last.traceInputStream?.bufferedReader()?.use { r ->
+                        val buf = CharArray(6000)
+                        val n = r.read(buf)
+                        if (n > 0) String(buf, 0, n) else ""
+                    } ?: ""
+                    val at = trace.indexOf("\"main\" prio")
+                    text += "\n" + (if (at >= 0) trace.substring(at) else trace).take(800)
+                } catch (e: Exception) { }
+            }
+            showInfo("Last time $name", text.take(1100))
+        } catch (e: Exception) { }
     }
 
     private fun status(msg: String) { runOnUiThread { toast(msg) } }

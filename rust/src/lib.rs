@@ -16,6 +16,8 @@ use std::time::Duration;
 
 enum Msg {
     Load(String, Sender<bool>),
+    LoadCache(String, Sender<bool>),
+    SaveCache(String, Sender<bool>),
     Check(String, String, String, Sender<bool>),
     Cosmetic(String, Sender<String>),
 }
@@ -38,6 +40,8 @@ fn sender() -> Sender<Msg> {
 }
 
 fn worker(rx: Receiver<Msg>) {
+    // Parsing the filter lists is heavy: run it at the lowest priority so the UI and WebView stay smooth.
+    let _ = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 19) };
     let mut engine: Option<Engine> = None;
     while let Ok(msg) = rx.recv() {
         // If handling panics, the reply sender is dropped and the caller just gets "false"/"".
@@ -56,6 +60,35 @@ fn handle(engine: &mut Option<Engine>, msg: Msg) {
             drop(lines);
             *engine = Some(Engine::from_filter_set(set, true));
             let _ = reply.send(true);
+        }
+        Msg::LoadCache(path, reply) => {
+            *engine = None;
+            let ok = match std::fs::read(&path) {
+                Ok(bytes) => {
+                    let mut e = Engine::new(true);
+                    if e.deserialize(&bytes).is_ok() {
+                        *engine = Some(e);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Err(_) => false,
+            };
+            let _ = reply.send(ok);
+        }
+        Msg::SaveCache(path, reply) => {
+            let ok = match engine.as_ref() {
+                Some(e) => match e.serialize_raw() {
+                    Ok(bytes) => {
+                        let tmp = format!("{}.tmp", path);
+                        std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, &path).is_ok()
+                    }
+                    Err(_) => false,
+                },
+                None => false,
+            };
+            let _ = reply.send(ok);
         }
         Msg::Check(url, source, rtype, reply) => {
             let blocked = match (engine.as_ref(), Request::new(&url, &source, &rtype)) {
@@ -132,4 +165,32 @@ pub extern "system" fn Java_com_tvbrowser_AdBlock_nativeCosmetic(
     }
     let css = rx.recv_timeout(Duration::from_millis(1000)).unwrap_or_default();
     env.new_string(css).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tvbrowser_AdBlock_nativeLoadCache(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: JString,
+) -> jboolean {
+    let Some(p) = get(&mut env, &path) else { return 0 };
+    let (tx, rx) = channel();
+    if sender().send(Msg::LoadCache(p, tx)).is_err() {
+        return 0;
+    }
+    rx.recv().unwrap_or(false) as jboolean
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tvbrowser_AdBlock_nativeSaveCache(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: JString,
+) -> jboolean {
+    let Some(p) = get(&mut env, &path) else { return 0 };
+    let (tx, rx) = channel();
+    if sender().send(Msg::SaveCache(p, tx)).is_err() {
+        return 0;
+    }
+    rx.recv().unwrap_or(false) as jboolean
 }
