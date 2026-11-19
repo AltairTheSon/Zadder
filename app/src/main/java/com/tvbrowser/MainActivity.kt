@@ -25,6 +25,7 @@ import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
+import android.view.WindowInsets
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
@@ -106,6 +107,7 @@ class MainActivity : Activity() {
     private var okLong = false
     private var lastUp = 0L
     private var lastDown = 0L
+    private var downStartY = Float.MAX_VALUE
 
     // what the user last tapped (used to tell real clicks from scripted redirects)
     @Volatile private var lastTap = 0L
@@ -267,6 +269,12 @@ class MainActivity : Activity() {
             override fun onHideCustomView() = hideCustom()
 
             override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message?): Boolean {
+                // While a video is full screen, refuse new windows outright: creating (and then destroying)
+                // a popup window is what kicked the player out of full screen.
+                if (customView != null && AdBlock.mode != AdBlock.Mode.OFF) {
+                    notifyBlocked("Blocked popup")
+                    return false
+                }
                 val msg = resultMsg ?: return false
                 val transport = msg.obj as? WebView.WebViewTransport ?: return false
                 val popup = WebView(this@MainActivity)
@@ -730,7 +738,13 @@ class MainActivity : Activity() {
                     if (!held[idx]) heldSince[idx] = System.nanoTime()
                     held[idx] = true
                     if (idx == 0) { if (now - lastUp < 350 && !scrollMode) jumpToToolbar(); lastUp = now }
-                    if (idx == 1) { if (now - lastDown < 350 && !scrollMode) returnFromToolbar(); lastDown = now }
+                    if (idx == 1) {
+                        // Double-tap DOWN while the first tap started in the toolbar: go back to where we were.
+                        if (now - lastDown < 350 && !scrollMode && downStartY <= toolbar.height) {
+                            returnFromToolbar(); downStartY = Float.MAX_VALUE
+                        } else downStartY = cursorY
+                        lastDown = now
+                    }
                     startLoop()
                 }
             } else held[idx] = false
@@ -798,15 +812,15 @@ class MainActivity : Activity() {
         val w = root.width.toFloat()
         val h = root.height.toFloat()
         if (w <= 0f) return
-        val zone = 70 * density
+        val margin = 8 * density
         val top = if (panel != null) 0f else toolbar.height.toFloat()
         var nx = cursorX + dx
         var ny = cursorY + dy
-        // Pushing against the top/bottom/side edge scrolls the page instead of moving the pointer.
-        if (dy > 0f && cursorY >= h - zone) { scrollContent(0f, dy * 1.5f); ny = cursorY }
-        else if (dy < 0f && cursorY <= top + zone && contentScrollY() > 0) { scrollContent(0f, dy * 1.5f); ny = cursorY }
-        if (dx > 0f && cursorX >= w - zone) { scrollContent(dx * 1.5f, 0f); nx = cursorX }
-        else if (dx < 0f && cursorX <= zone) { scrollContent(dx * 1.5f, 0f); nx = cursorX }
+        // The pointer travels right up to every screen border; pushing further against a border scrolls.
+        if (dy > 0f && cursorY >= h - 1f - margin) scrollContent(0f, dy * 1.5f)
+        else if (dy < 0f && cursorY <= top + margin && contentScrollY() > 0) { scrollContent(0f, dy * 1.5f); ny = cursorY }
+        if (dx > 0f && cursorX >= w - 1f - margin) scrollContent(dx * 1.5f, 0f)
+        else if (dx < 0f && cursorX <= margin) scrollContent(dx * 1.5f, 0f)
         cursorX = nx.coerceIn(0f, w - 1f)
         cursorY = ny.coerceIn(0f, h - 1f)
         cursor.setPos(cursorX, cursorY)
@@ -840,7 +854,7 @@ class MainActivity : Activity() {
     }
 
     private fun returnFromToolbar() {
-        if (panel != null || cursorY > toolbar.height) return
+        if (panel != null) return
         cursorY = if (savedY > toolbar.height) savedY else root.height / 2f
         cursor.setPos(cursorX, cursorY)
     }
@@ -864,13 +878,25 @@ class MainActivity : Activity() {
         }, 70)
     }
 
-    /** If the tap landed in a text field on the page, bring up the on-screen keyboard. */
-    private fun maybeShowKeyboard() {
+    private fun imeVisible(): Boolean =
+        Build.VERSION.SDK_INT >= 30 && web.rootWindowInsets?.isVisible(WindowInsets.Type.ime()) == true
+
+    /**
+     * If the tap landed in a text field on the page, make sure the on-screen keyboard is up.
+     * Some sites (YouTube) move focus around right after the tap and the keyboard closes again,
+     * so check a few times and bring it back while a field is still focused.
+     */
+    private fun maybeShowKeyboard(attempt: Int = 0) {
         if (urlBar.hasFocus() || panel != null) return
-        web.evaluateJavascript(
+        val w = web
+        w.evaluateJavascript(
             "(function(){var e=document.activeElement;return !!e&&(e.tagName==='INPUT'||e.tagName==='TEXTAREA'||e.isContentEditable===true)})()"
         ) { r ->
-            if (r == "true") { web.requestFocus(); imm().showSoftInput(web, 0) }
+            if (r == "true") {
+                if (!w.hasFocus()) w.requestFocus()
+                if (!imeVisible()) imm().showSoftInput(w, 0)
+                if (attempt < 2) ui.postDelayed({ maybeShowKeyboard(attempt + 1) }, 500)
+            }
         }
     }
 

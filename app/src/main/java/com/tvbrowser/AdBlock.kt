@@ -58,6 +58,7 @@ object AdBlock {
         "fx9olhkekguc56hoqj6mpy.rest",
         "rbhzzmglkf3wm8v.cfd",
         "llvpn.com",
+        "corornisoralogy.cfd",
     )
     private const val CUSTOM_PATH_HOST = "graphcomment.com"
     private const val CUSTOM_PATH = "/api/pub/view"
