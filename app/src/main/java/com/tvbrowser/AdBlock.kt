@@ -12,19 +12,52 @@ object AdBlock {
     private const val TAG = "AdBlock"
     private const val MAX_AGE_MS = 3L * 24 * 60 * 60 * 1000
 
-    // Trim this list if you want it even lighter.
-    private val LISTS = listOf(
+    enum class Mode { OFF, STANDARD, AGGRESSIVE }
+
+    @Volatile
+    var mode = Mode.AGGRESSIVE
+
+    val enabled: Boolean get() = mode != Mode.OFF
+    val aggressive: Boolean get() = mode == Mode.AGGRESSIVE
+
+    // Standard = these lists. Aggressive = these + the extra lists below (like Brave's "Aggressive" shield).
+    private val CORE = listOf(
         "easylist.txt" to "https://easylist.to/easylist/easylist.txt",
         "easyprivacy.txt" to "https://easylist.to/easylist/easyprivacy.txt",
         "ublock-filters.txt" to "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt",
+        "ublock-unbreak.txt" to "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/unbreak.txt",
     )
+    private val EXTRA = listOf(
+        "ublock-privacy.txt" to "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/privacy.txt",
+        "ublock-badware.txt" to "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/badware.txt",
+        "ublock-abuse.txt" to "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/resource-abuse.txt",
+        "fanboy-annoyance.txt" to "https://easylist.to/easylist/fanboy-annoyance.txt",
+        "adguard-base.txt" to "https://filters.adtidy.org/extension/ublock/filters/2_without_easylist.txt",
+        "adguard-tracking.txt" to "https://filters.adtidy.org/extension/ublock/filters/3.txt",
+    )
+
+    // Your own block list. One rule per line; "||domain^" blocks the domain and all its subdomains.
+    private val CUSTOM = listOf(
+        "||acscdn.com^",
+        "||histats.com^",
+        "||cloudflareinsights.com^",
+        "||googletagmanager.com^",
+        "||ligabletownman.com^",
+        "||fx9olhkekguc56hoqj6mpy.rest^",
+        "||rbhzzmglkf3wm8v.cfd^",
+        "||graphcomment.com/api/pub/view",
+        "||llvpn.com^",
+    ).joinToString("\n")
 
     @Volatile
     var ready = false
         private set
 
     @Volatile
-    var enabled = true
+    private var loading = false
+
+    @Volatile
+    private var loadedSet = ""
 
     val blockedCount = AtomicInteger(0)
 
@@ -38,24 +71,39 @@ object AdBlock {
     @JvmStatic external fun nativeShouldBlock(url: String, source: String, type: String): Boolean
     @JvmStatic external fun nativeCosmetic(url: String): String?
 
-    fun start(ctx: Context, onStatus: (String) -> Unit) {
+    private fun wanted() = if (mode == Mode.AGGRESSIVE) "aggressive" else "standard"
+
+    /** Loads (or reloads, when the mode changed) the filter lists in the background. */
+    fun ensureLoaded(ctx: Context, onStatus: (String) -> Unit) {
         if (!nativeOk) { onStatus("Ad blocker unavailable (native library failed to load)"); return }
+        if (mode == Mode.OFF || loading) return
+        val set = wanted()
+        if (set == loadedSet && ready) return
+        loading = true
+        ready = false
         Thread {
             try {
-                onStatus("Ad blocker: loading filter lists...")
+                onStatus("Loading $set ad-block lists...")
                 val dir = File(ctx.filesDir, "filters").apply { mkdirs() }
                 val sb = StringBuilder()
-                for ((name, url) in LISTS) {
+                val lists = if (set == "aggressive") CORE + EXTRA else CORE
+                for ((name, url) in lists) {
                     val f = File(dir, name)
                     if (!f.exists() || System.currentTimeMillis() - f.lastModified() > MAX_AGE_MS) download(url, f)
                     if (f.exists()) sb.append(f.readText()).append('\n')
                 }
-                if (sb.isEmpty()) { onStatus("Ad blocker: no filter lists (check network)"); return@Thread }
-                ready = nativeLoad(sb.toString())
-                onStatus(if (ready) "Ad blocker ready" else "Ad blocker failed to load")
+                sb.append(CUSTOM).append('\n')
+                val ok = nativeLoad(sb.toString())
+                if (ok) loadedSet = set
+                ready = ok
+                onStatus(if (ok) "Ad blocker ready ($set)" else "Ad blocker failed to load")
             } catch (t: Throwable) {
-                Log.e(TAG, "start failed", t); onStatus("Ad blocker error: ${t.message}")
+                Log.e(TAG, "load failed", t); onStatus("Ad blocker error: ${t.message}")
+            } finally {
+                loading = false
             }
+            // The mode may have been switched while we were loading.
+            if (mode != Mode.OFF && wanted() != loadedSet) ensureLoaded(ctx, onStatus)
         }.apply { name = "adblock-init"; start() }
     }
 

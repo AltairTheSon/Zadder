@@ -39,6 +39,7 @@ fn worker(rx: Receiver<Msg>) {
     while let Ok(msg) = rx.recv() {
         match msg {
             Msg::Load(rules, reply) => {
+                engine = None; // free the old engine first to keep peak memory low
                 let lines: Vec<String> = rules.lines().map(|s| s.to_string()).collect();
                 let mut set = FilterSet::new(false);
                 set.add_filters(&lines, ParseOptions::default());

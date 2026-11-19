@@ -13,12 +13,12 @@
         <LinearLayout
             android:id="@+id/toolbar"
             android:layout_width="match_parent"
-            android:layout_height="56dp"
+            android:layout_height="52dp"
             android:orientation="horizontal"
             android:gravity="center_vertical"
             android:background="#202124"
-            android:paddingLeft="12dp"
-            android:paddingRight="12dp">
+            android:paddingLeft="8dp"
+            android:paddingRight="8dp">
 
             <TextView android:id="@+id/btnBack" style="@style/TbBtn" android:text="Back" />
             <TextView android:id="@+id/btnFwd" style="@style/TbBtn" android:text="Fwd" />
@@ -28,23 +28,26 @@
             <EditText
                 android:id="@+id/urlBar"
                 android:layout_width="0dp"
-                android:layout_height="40dp"
+                android:layout_height="38dp"
                 android:layout_weight="1"
-                android:layout_marginLeft="8dp"
-                android:layout_marginRight="8dp"
+                android:layout_marginLeft="6dp"
+                android:layout_marginRight="6dp"
                 android:paddingLeft="12dp"
                 android:paddingRight="12dp"
                 android:background="#303134"
                 android:hint="Search or enter address"
                 android:textColor="#FFFFFF"
                 android:textColorHint="#9AA0A6"
-                android:textSize="16sp"
+                android:textSize="15sp"
                 android:singleLine="true"
                 android:selectAllOnFocus="true"
                 android:inputType="textUri"
                 android:imeOptions="actionGo" />
 
-            <TextView android:id="@+id/btnShield" style="@style/TbBtn" android:text="Ads: ON" />
+            <TextView android:id="@+id/btnTabs" style="@style/TbBtn" android:text="Tabs (1)" />
+            <TextView android:id="@+id/btnFavs" style="@style/TbBtn" android:text="Favorites" />
+            <TextView android:id="@+id/btnFav" style="@style/TbBtn" android:text="+ Fav" />
+            <TextView android:id="@+id/btnShield" style="@style/TbBtn" android:text="Shield" />
         </LinearLayout>
 
         <ProgressBar
@@ -55,12 +58,11 @@
             android:max="100"
             android:visibility="gone" />
 
-        <WebView
-            android:id="@+id/web"
+        <FrameLayout
+            android:id="@+id/webHolder"
             android:layout_width="match_parent"
             android:layout_height="0dp"
-            android:layout_weight="1"
-            android:focusable="true" />
+            android:layout_weight="1" />
     </LinearLayout>
 
     <com.tvbrowser.CursorView
