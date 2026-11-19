@@ -507,6 +507,7 @@ class MainActivity : Activity() {
         shield.text = when {
             AdBlock.mode == AdBlock.Mode.OFF -> "Shield: OFF"
             !AdBlock.ready -> "Shield: loading"
+            AdBlock.aggressive && AdBlock.domainCount == 0 -> "Aggr: loading"
             AdBlock.aggressive -> "Aggr ($n)"
             else -> "Std ($n)"
         }

@@ -10,6 +10,7 @@ import android.util.Log
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicInteger
 
 /** Kotlin side of Brave's adblock-rust engine (native code lives in /rust). */
@@ -29,19 +30,21 @@ object AdBlock {
     val enabled: Boolean get() = mode != Mode.OFF
     val aggressive: Boolean get() = mode == Mode.AGGRESSIVE
 
-    // Standard = these lists. Aggressive = these + the extra lists below (like Brave's "Aggressive" shield).
+    // The engine always uses these lists (Standard and Aggressive share one engine, so switching is instant).
     private val CORE = listOf(
         "easylist.txt" to "https://easylist.to/easylist/easylist.txt",
         "easyprivacy.txt" to "https://easylist.to/easylist/easyprivacy.txt",
         "ublock-filters.txt" to "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt",
         "ublock-unbreak.txt" to "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/unbreak.txt",
     )
-    private val EXTRA = listOf(
-        "ublock-privacy.txt" to "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/privacy.txt",
-        "ublock-badware.txt" to "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/badware.txt",
-        "ublock-abuse.txt" to "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/resource-abuse.txt",
-        "adguard-tracking.txt" to "https://filters.adtidy.org/extension/ublock/filters/3.txt",
+
+    // Aggressive adds a big list of ad / tracker / pop-up domains (Hagezi "Pro" + "Pop-up ads").
+    // They are stored as 64-bit hashes (about 2 MB in memory) and only block third-party requests.
+    private val DOMAIN_LISTS = listOf(
+        "hagezi-pro.txt" to "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro-onlydomains.txt",
+        "hagezi-popup.txt" to "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/popupads-onlydomains.txt",
     )
+    private const val DOMAINS_MAX_AGE_MS = 7L * 24 * 60 * 60 * 1000
 
     // ---- Your own block list. Always active in Standard and Aggressive (not when the shield is OFF).
     // It is checked directly in Kotlin, so it works instantly at startup and even if the engine fails.
@@ -86,11 +89,7 @@ object AdBlock {
     @JvmStatic external fun nativeShouldBlock(url: String, source: String, type: String): Boolean
     @JvmStatic external fun nativeCosmetic(url: String): String?
 
-    private fun wanted() = when {
-        forceLite -> "lite"
-        mode == Mode.AGGRESSIVE -> "aggressive"
-        else -> "standard"
-    }
+    private fun wanted() = if (forceLite) "lite" else "standard"
 
     /** Call when the user switches the shield: gives the full lists another chance after a failure. */
     fun resetFailure(ctx: Context) {
@@ -113,6 +112,7 @@ object AdBlock {
 
     /** Loads (or reloads, when the mode changed) the filter lists in the background. */
     fun ensureLoaded(ctx: Context, onStatus: (String) -> Unit) {
+        if (aggressive) ensureDomains(ctx, onStatus)
         if (!nativeOk) { onStatus("Ad blocker engine unavailable (your custom block list still works)"); return }
         if (mode == Mode.OFF || loading) return
         val prefs = ctx.getSharedPreferences("tvb", Context.MODE_PRIVATE)
@@ -145,8 +145,7 @@ object AdBlock {
                     if (set != "lite") onStatus("Building the $set ad-block lists (first start takes a minute)...")
                     val sb = StringBuilder(4_000_000)
                     if (set != "lite") {
-                        val lists = if (set == "aggressive") CORE + EXTRA else CORE
-                        for ((name, url) in lists) {
+                        for ((name, url) in CORE) {
                             val f = File(dir, name)
                             if (!f.exists() || System.currentTimeMillis() - f.lastModified() > MAX_AGE_MS) download(url, f)
                             if (f.exists()) appendFiltered(f, sb)
@@ -204,6 +203,104 @@ object AdBlock {
         }
     }
 
+    @Volatile
+    private var domainHashes = LongArray(0)
+
+    @Volatile
+    private var domainsLoading = false
+
+    val domainCount: Int get() = domainHashes.size
+
+    private fun h64(s: String): Long {
+        var h = -3750763034362895579L
+        for (c in s) h = (h xor c.code.toLong()) * 1099511628211L
+        return h
+    }
+
+    /** Loads the Aggressive domain list in the background (small and fast; cached for a week). */
+    private fun ensureDomains(ctx: Context, onStatus: (String) -> Unit) {
+        if (domainsLoading || domainHashes.isNotEmpty()) return
+        domainsLoading = true
+        Thread {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
+            try {
+                val dir = File(ctx.filesDir, "filters").apply { mkdirs() }
+                val cache = File(dir, "domains.bin")
+                if (!(cache.exists() && System.currentTimeMillis() - cache.lastModified() < DOMAINS_MAX_AGE_MS)) {
+                    onStatus("Aggressive shield: downloading the tracker domain list...")
+                    var arr = LongArray(320_000)
+                    var n = 0
+                    for ((name, url) in DOMAIN_LISTS) {
+                        val f = File(dir, name)
+                        download(url, f)
+                        if (!f.exists()) continue
+                        f.useLines { lines ->
+                            for (line in lines) {
+                                val d = line.trim().lowercase()
+                                if (d.isEmpty() || d[0] == '#' || d[0] == '!' || d.contains('/') || d.contains(' ')) continue
+                                if (n == arr.size) arr = arr.copyOf(n * 2)
+                                arr[n++] = h64(d)
+                            }
+                        }
+                        f.delete()
+                    }
+                    if (n > 0) {
+                        java.util.Arrays.sort(arr, 0, n)
+                        var m = 0
+                        for (i in 0 until n) if (i == 0 || arr[i] != arr[i - 1]) arr[m++] = arr[i]
+                        val out = arr.copyOf(m)
+                        val bb = ByteBuffer.allocate(m * 8)
+                        bb.asLongBuffer().put(out)
+                        val tmp = File(cache.path + ".tmp")
+                        tmp.writeBytes(bb.array())
+                        tmp.renameTo(cache)
+                    }
+                }
+                if (cache.exists()) {
+                    val lb = ByteBuffer.wrap(cache.readBytes()).asLongBuffer()
+                    val a = LongArray(lb.remaining())
+                    lb.get(a)
+                    domainHashes = a
+                    onStatus("Aggressive shield ready (${a.size} domains)")
+                } else {
+                    onStatus("Aggressive shield: could not download the domain list (check the network)")
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "domain list failed", t)
+            } finally {
+                domainsLoading = false
+            }
+        }.apply { name = "adblock-domains"; start() }
+    }
+
+    private fun domainBlocked(url: String): Boolean {
+        val arr = domainHashes
+        if (arr.isEmpty()) return false
+        val host = try { Uri.parse(url).host?.lowercase() } catch (e: Exception) { null } ?: return false
+        var start = 0
+        while (true) {
+            if (java.util.Arrays.binarySearch(arr, h64(host.substring(start))) >= 0) return true
+            val dot = host.indexOf('.', start)
+            if (dot < 0) return false
+            val next = dot + 1
+            if (host.indexOf('.', next) < 0) return false   // don't test a bare TLD like "com"
+            start = next
+        }
+    }
+
+    private fun baseDomain(url: String): String {
+        val host = try { Uri.parse(url).host ?: "" } catch (e: Exception) { "" }
+        val parts = host.split('.')
+        return if (parts.size <= 2) host else parts.takeLast(2).joinToString(".")
+    }
+
+    private fun isThirdParty(url: String, source: String): Boolean {
+        if (source.isEmpty()) return false
+        val a = baseDomain(url)
+        val b = baseDomain(source)
+        return a.isNotEmpty() && b.isNotEmpty() && a != b
+    }
+
     /** Your custom list, checked without the engine. */
     private fun customBlocked(url: String): Boolean {
         val uri = try { Uri.parse(url) } catch (e: Exception) { return false }
@@ -217,6 +314,7 @@ object AdBlock {
     fun shouldBlock(url: String, source: String, type: String): Boolean {
         if (!enabled) return false
         if (customBlocked(url)) { blockedCount.incrementAndGet(); return true }
+        if (aggressive && isThirdParty(url, source) && domainBlocked(url)) { blockedCount.incrementAndGet(); return true }
         if (!ready) return false
         val b = nativeShouldBlock(url, source, type)
         if (b) blockedCount.incrementAndGet()
@@ -227,6 +325,7 @@ object AdBlock {
     fun shouldBlockNavigation(url: String, source: String): Boolean {
         if (!enabled) return false
         if (customBlocked(url)) { blockedCount.incrementAndGet(); return true }
+        if (aggressive && isThirdParty(url, source) && domainBlocked(url)) { blockedCount.incrementAndGet(); return true }
         if (!ready) return false
         for (type in arrayOf("document", "subdocument", "popup")) {
             if (nativeShouldBlock(url, source, type)) { blockedCount.incrementAndGet(); return true }
