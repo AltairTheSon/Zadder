@@ -21,3 +21,8 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
 }
+
+dependencies {
+    // Lets us run a script at the very start of every page and frame (popup guard, tap tracking).
+    implementation("androidx.webkit:webkit:1.12.1")
+}

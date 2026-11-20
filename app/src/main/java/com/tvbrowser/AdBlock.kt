@@ -295,6 +295,23 @@ object AdBlock {
         return if (parts.size <= 2) host else parts.takeLast(2).joinToString(".")
     }
 
+    // YouTube stops playing ("Something went wrong") when only some of its ad/telemetry hosts are blocked,
+    // so the big Aggressive domain list is never applied to YouTube or to requests to its servers.
+    private val DOMAIN_LIST_EXEMPT = listOf(
+        "youtube.com", "youtu.be", "youtube-nocookie.com", "googlevideo.com", "ytimg.com", "ggpht.com",
+    )
+
+    private fun hostOf(url: String): String? = try { Uri.parse(url).host?.lowercase() } catch (e: Exception) { null }
+
+    private fun exempt(host: String?): Boolean {
+        if (host == null) return false
+        for (d in DOMAIN_LIST_EXEMPT) if (host == d || host.endsWith(".$d")) return true
+        return false
+    }
+
+    private fun domainListApplies(url: String, source: String): Boolean =
+        !exempt(hostOf(url)) && !exempt(hostOf(source))
+
     private fun isThirdParty(url: String, source: String): Boolean {
         if (source.isEmpty()) return false
         val a = baseDomain(url)
@@ -315,7 +332,7 @@ object AdBlock {
     fun shouldBlock(url: String, source: String, type: String): Boolean {
         if (!enabled) return false
         if (customBlocked(url)) { blockedCount.incrementAndGet(); return true }
-        if (aggressive && isThirdParty(url, source) && domainBlocked(url)) { blockedCount.incrementAndGet(); return true }
+        if (aggressive && domainListApplies(url, source) && isThirdParty(url, source) && domainBlocked(url)) { blockedCount.incrementAndGet(); return true }
         if (!ready) return false
         val b = nativeShouldBlock(url, source, type)
         if (b) blockedCount.incrementAndGet()
@@ -326,7 +343,7 @@ object AdBlock {
     fun shouldBlockNavigation(url: String, source: String): Boolean {
         if (!enabled) return false
         if (customBlocked(url)) { blockedCount.incrementAndGet(); return true }
-        if (aggressive && isThirdParty(url, source) && domainBlocked(url)) { blockedCount.incrementAndGet(); return true }
+        if (aggressive && domainListApplies(url, source) && isThirdParty(url, source) && domainBlocked(url)) { blockedCount.incrementAndGet(); return true }
         if (!ready) return false
         for (type in arrayOf("document", "subdocument", "popup")) {
             if (nativeShouldBlock(url, source, type)) { blockedCount.incrementAndGet(); return true }

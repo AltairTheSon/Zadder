@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.ActivityManager
 import android.app.ApplicationExitInfo
+import android.content.ComponentCallbacks2
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
@@ -30,6 +31,8 @@ import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.webkit.JavascriptInterface
+import android.webkit.JsPromptResult
+import android.webkit.JsResult
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -45,6 +48,8 @@ import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
@@ -52,11 +57,42 @@ import java.net.URLEncoder
 import java.util.concurrent.Executors
 
 const val HOME_URL = "https://tvbrowser.home/"
+private const val MAX_TABS = 6
+
+/**
+ * Runs at the start of every page and frame (when the WebView supports it).
+ * - remembers real (trusted) taps, so scripted clicks can't pass as the user
+ * - asks the app before any window.open() and silently drops popups the app refuses
+ * - ignores scripted clicks on links that would open another site / a new tab (pop-under ads)
+ */
+private const val PAGE_JS = """
+(function(){
+ if(window.__tvb)return; window.__tvb=1;
+ function f(e){ if(!e.isTrusted)return; var n=e.target,a=n&&n.closest?n.closest('a[href]'):null; try{TVB.tap(a?a.href:'')}catch(x){} }
+ document.addEventListener('pointerdown',f,true);
+ document.addEventListener('click',f,true);
+ var _open=window.open;
+ window.open=function(u){
+  var ok=true;
+  try{ var abs=''; if(u!=null&&String(u)!==''){ abs=String(u); try{abs=new URL(abs,location.href).href}catch(x){} } ok=TVB.allowPopup(abs); }catch(x){}
+  if(!ok)return null;
+  return _open.apply(this,arguments);
+ };
+ document.addEventListener('click',function(e){
+  if(e.isTrusted)return;
+  var a=e.target&&e.target.closest?e.target.closest('a[href]'):null;
+  if(a&&(a.target==='_blank'||a.origin!==location.origin)){e.preventDefault();e.stopImmediatePropagation();}
+ },true);
+})();
+"""
 
 class Tab(var web: WebView) {
     @Volatile var pageUrl = ""
     var chainOk = true   // true when the current navigation chain was started by the user
     var lastCosmetic = ""
+    var docStart = false          // the page script is installed by the WebView at document start
+    var popupPending = false      // a popup tab that still has to pass its first check
+    var popupOpener = ""
 }
 
 private class Row(val title: String, val sub: String, val onClick: () -> Unit, val onDelete: (() -> Unit)? = null)
@@ -108,6 +144,18 @@ class MainActivity : Activity() {
     private var lastUp = 0L
     private var lastDown = 0L
     private var downStartY = Float.MAX_VALUE
+    private var lastLeft = 0L
+    private var lastRight = 0L
+    private var edgeJump = 0          // -1: pointer was jumped to the left edge, 1: right edge
+    private var savedX = 0f
+
+    // full screen video + popups
+    private var fsPointer = false     // pointer shown while a video is full screen
+    private var userExit = false
+    @Volatile private var lastPopupAt = 0L
+    @Volatile private var popupToken = 0L
+    @Volatile private var activePageUrl = ""
+    private val events = ArrayList<Pair<Long, String>>()
 
     // what the user last tapped (used to tell real clicks from scripted redirects)
     @Volatile private var lastTap = 0L
@@ -126,6 +174,50 @@ class MainActivity : Activity() {
     private inner class TapBridge {
         @JavascriptInterface
         fun tap(href: String?) { tapHref = href ?: ""; lastTap = SystemClock.uptimeMillis() }
+
+        @JavascriptInterface
+        fun allowPopup(url: String?): Boolean {
+            val ok = popupDecision(url ?: "")
+            trace(if (ok) "window.open allowed" else "window.open blocked")
+            if (!ok) notifyBlocked("Blocked popup")
+            return ok
+        }
+    }
+
+    private fun trace(what: String) {
+        synchronized(events) {
+            events.add(SystemClock.uptimeMillis() to what)
+            while (events.size > 20) events.removeAt(0)
+        }
+    }
+
+    /** Is this URL (from window.open) a popup the user wants? Never during full screen, never in bursts. */
+    private fun popupDecision(u: String): Boolean {
+        if (AdBlock.mode == AdBlock.Mode.OFF) return true
+        if (customView != null) return false
+        val now = SystemClock.uptimeMillis()
+        if (now - lastPopupAt < 1500 || tabs.size >= MAX_TABS) return false
+        val ok = if (u.startsWith("http")) popupAllowed(u, activePageUrl) else recentTap()
+        if (ok) { lastPopupAt = now; popupToken = now + 2000 }
+        return ok
+    }
+
+    /** A popup is fine when it is a link you tapped, or it stays on the same site (e.g. a video player window). */
+    private fun popupAllowed(url: String, opener: String): Boolean {
+        if (AdBlock.mode == AdBlock.Mode.OFF) return true
+        if (AdBlock.shouldBlockNavigation(url, opener)) return false
+        val linkTap = recentTap() && tapHref.isNotEmpty()
+        return linkTap || !isCrossSite(opener, url)
+    }
+
+    /** Native fallback for windows that didn't go through the page script (e.g. from iframes without it). */
+    private fun admitPopup(): Boolean {
+        if (AdBlock.mode == AdBlock.Mode.OFF) return true
+        val now = SystemClock.uptimeMillis()
+        if (now <= popupToken) { popupToken = 0L; return true }
+        if (customView != null || tabs.size >= MAX_TABS || now - lastPopupAt < 1500) return false
+        lastPopupAt = now
+        return true
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -196,6 +288,12 @@ class MainActivity : Activity() {
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$chrome Safari/537.36"
         w.isFocusable = true
         w.addJavascriptInterface(TapBridge(), "TVB")
+        try {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                WebViewCompat.addDocumentStartJavaScript(w, PAGE_JS, setOf("*"))
+                t.docStart = true
+            }
+        } catch (e: Throwable) { Log.w("TVB", "document-start script unavailable", e) }
 
         w.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
@@ -206,6 +304,17 @@ class MainActivity : Activity() {
                         WebResourceResponse("text/html", "utf-8", ByteArrayInputStream(homeHtml().toByteArray(Charsets.UTF_8)))
                     else
                         WebResourceResponse("text/plain", "utf-8", 404, "Not Found", null, ByteArrayInputStream(ByteArray(0)))
+                }
+                if (request.isForMainFrame && t.popupPending) {
+                    t.popupPending = false
+                    if (url.startsWith("http") && !popupAllowed(url, t.popupOpener)) {
+                        trace("popup tab blocked")
+                        notifyBlocked("Blocked popup")
+                        ui.post { closePopupTab(t) }
+                        return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+                    }
+                    ui.post { val i = tabs.indexOf(t); if (i >= 0) switchTo(i) }
+                    return null
                 }
                 if (request.isForMainFrame) return null
                 if (!url.startsWith("http")) return null
@@ -229,6 +338,7 @@ class MainActivity : Activity() {
                 t.pageUrl = url ?: ""
                 t.lastCosmetic = ""
                 if (t === tab) {
+                    activePageUrl = t.pageUrl
                     if (!urlBar.hasFocus()) urlBar.setText(if (isHome(t.pageUrl)) "" else t.pageUrl)
                     progress.visibility = View.VISIBLE
                     updateFavButton()
@@ -264,51 +374,79 @@ class MainActivity : Activity() {
                 customCallback = callback
                 root.addView(view, FrameLayout.LayoutParams(MATCH, MATCH))
                 cursor.bringToFront()
+                // Full screen video: hide the pointer (it also forced the video to be composited every frame).
+                fsPointer = false
+                held.fill(false)
+                cursor.visibility = View.GONE
             }
 
-            override fun onHideCustomView() = hideCustom()
+            override fun onHideCustomView() {
+                if (customView == null) return              // we closed it ourselves
+                if (!userExit) reportFullscreenExit()
+                userExit = false
+                hideCustom()
+            }
 
             override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message?): Boolean {
-                // While a video is full screen, refuse new windows outright: creating (and then destroying)
-                // a popup window is what kicked the player out of full screen.
-                if (customView != null && AdBlock.mode != AdBlock.Mode.OFF) {
-                    notifyBlocked("Blocked popup")
-                    return false
-                }
+                trace("onCreateWindow")
                 val msg = resultMsg ?: return false
                 val transport = msg.obj as? WebView.WebViewTransport ?: return false
-                val popup = WebView(this@MainActivity)
-                var handled = false
-                fun handle(url: String?) {
-                    if (handled || url.isNullOrEmpty() || url == "about:blank") return
-                    handled = true
-                    ui.post {
-                        val tapped = recentTap() || isUserGesture
-                        val ok = url.startsWith("http") && (AdBlock.mode == AdBlock.Mode.OFF ||
-                            (!AdBlock.shouldBlockNavigation(url, t.pageUrl) &&
-                                (if (AdBlock.aggressive) recentTap() && tapHref.isNotEmpty() else tapped)))
-                        if (ok) newTab(url) else notifyBlocked("Blocked popup")
-                        popup.stopLoading(); popup.destroy()
-                    }
-                }
-                popup.webViewClient = object : WebViewClient() {
-                    override fun shouldOverrideUrlLoading(v: WebView?, r: WebResourceRequest?): Boolean {
-                        handle(r?.url?.toString()); return true
-                    }
-                    override fun shouldInterceptRequest(v: WebView?, r: WebResourceRequest?): WebResourceResponse? {
-                        if (r != null && r.isForMainFrame) {
-                            handle(r.url.toString())
-                            return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
-                        }
-                        return null
-                    }
-                }
-                ui.postDelayed({ if (!handled) { handled = true; popup.destroy() } }, 10000)
-                transport.webView = popup
+                if (!admitPopup()) { notifyBlocked("Blocked popup"); return false }
+                // The popup becomes a real (hidden) tab, so window.opener, form posts etc. keep working.
+                // It is shown only after its first request passes the ad check; otherwise it is closed.
+                val nt = newTab(null, activate = false)
+                nt.popupOpener = t.pageUrl
+                nt.popupPending = AdBlock.mode != AdBlock.Mode.OFF
+                transport.webView = nt.web
                 msg.sendToTarget()
+                if (nt.popupPending) {
+                    ui.postDelayed({ if (tabs.contains(nt) && nt.popupPending) closePopupTab(nt) }, 10000)
+                } else {
+                    ui.post { val i = tabs.indexOf(nt); if (i >= 0) switchTo(i) }
+                }
                 return true
             }
+
+            override fun onCloseWindow(window: WebView?) {
+                ui.post {
+                    val i = tabs.indexOfFirst { it.web === window }
+                    if (i >= 0 && tabs.size > 1) closeTab(i)
+                }
+            }
+
+            override fun onJsAlert(view: WebView?, url: String?, message: String?, result: JsResult?): Boolean {
+                trace("alert()")
+                if (customView != null) { result?.cancel(); return true }
+                return false
+            }
+
+            override fun onJsConfirm(view: WebView?, url: String?, message: String?, result: JsResult?): Boolean {
+                trace("confirm()")
+                if (customView != null) { result?.cancel(); return true }
+                return false
+            }
+
+            override fun onJsPrompt(view: WebView?, url: String?, message: String?, defaultValue: String?, result: JsPromptResult?): Boolean {
+                trace("prompt()")
+                if (customView != null) { result?.cancel(); return true }
+                return false
+            }
         }
+    }
+
+    private fun closePopupTab(t: Tab) {
+        val i = tabs.indexOf(t)
+        if (i >= 0 && tabs.size > 1) closeTab(i)
+    }
+
+    /** Tells the user (and me) what happened just before a video left full screen on its own. */
+    private fun reportFullscreenExit() {
+        val now = SystemClock.uptimeMillis()
+        val recent = synchronized(events) { events.filter { now - it.first < 2500 }.map { it.second } }
+        toast(
+            if (recent.isEmpty()) "Left full screen by itself (no popup or redirect seen)"
+            else "Left full screen. Just before: " + recent.joinToString(", ")
+        )
     }
 
     private fun newTab(url: String?, activate: Boolean = true): Tab {
@@ -325,12 +463,28 @@ class MainActivity : Activity() {
 
     private fun switchTo(i: Int) {
         cur = i
-        for ((idx, t) in tabs.withIndex()) t.web.visibility = if (idx == i) View.VISIBLE else View.GONE
+        for ((idx, t) in tabs.withIndex()) {
+            if (idx == i) t.web.visibility = View.VISIBLE
+            else {
+                // A hidden tab must not keep decoding video / playing ad audio (TV boxes have very few decoders).
+                if (t.web.visibility == View.VISIBLE) pauseMedia(t)
+                t.web.visibility = View.GONE
+            }
+        }
+        activePageUrl = tab.pageUrl
         web.requestFocus()
         if (!urlBar.hasFocus()) urlBar.setText(if (isHome(tab.pageUrl)) "" else tab.pageUrl)
         progress.visibility = View.GONE
         updateTabsLabel()
         updateFavButton()
+    }
+
+    private fun pauseMedia(t: Tab) {
+        try {
+            t.web.evaluateJavascript(
+                "document.querySelectorAll('video,audio').forEach(function(m){try{m.pause()}catch(e){}})", null
+            )
+        } catch (e: Exception) { }
     }
 
     private fun closeTab(i: Int) {
@@ -435,7 +589,7 @@ class MainActivity : Activity() {
     private fun blockNavigation(t: Tab, req: WebResourceRequest): Boolean {
         val target = req.url.toString()
         if (isHome(t.pageUrl)) { t.chainOk = true; return false }   // tapping a favorite / using the search box
-        if (AdBlock.shouldBlockNavigation(target, t.pageUrl)) { notifyBlocked("Blocked ad redirect"); return true }
+        if (AdBlock.shouldBlockNavigation(target, t.pageUrl)) { trace("blocked ad redirect"); notifyBlocked("Blocked ad redirect"); return true }
         val cross = isCrossSite(t.pageUrl, target)
         if (req.isRedirect) {
             if (AdBlock.aggressive && cross && !t.chainOk) { notifyBlocked("Blocked redirect (Aggressive shield)"); return true }
@@ -445,7 +599,7 @@ class MainActivity : Activity() {
         val linkOut = tapped && tapHref.isNotEmpty() && baseDomain(tapHref) == baseDomain(target)
         t.chainOk = cross && linkOut
         val block = cross && (if (AdBlock.aggressive) !linkOut else !tapped)
-        if (block) notifyBlocked(if (tapped) "Blocked redirect (Aggressive shield)" else "Blocked automatic redirect")
+        if (block) { trace("blocked redirect"); notifyBlocked(if (tapped) "Blocked redirect (Aggressive shield)" else "Blocked automatic redirect") }
         return block
     }
 
@@ -467,14 +621,8 @@ class MainActivity : Activity() {
     }
 
     private fun injectBridge(t: Tab) {
-        try {
-            t.web.evaluateJavascript(
-                "(function(){if(window.__tvb)return;window.__tvb=1;" +
-                    "function f(e){var n=e.target,a=n&&n.closest?n.closest('a[href]'):null;TVB.tap(a?a.href:'');}" +
-                    "document.addEventListener('pointerdown',f,true);document.addEventListener('click',f,true);})();",
-                null
-            )
-        } catch (e: Exception) { }
+        if (t.docStart) return
+        try { t.web.evaluateJavascript(PAGE_JS, null) } catch (e: Exception) { }
     }
 
     /** Looks the hide-rules up on a background thread (they can be slow) and injects them on the UI thread. */
@@ -567,7 +715,7 @@ class MainActivity : Activity() {
 
     private fun showTabs() {
         val rows = ArrayList<Row>()
-        rows.add(Row("+ New tab", "Opens your favorites", { hidePanel(); newTab(home) }))
+        rows.add(Row("+ New tab", "Opens your favorites", { hidePanel(); if (tabs.size >= MAX_TABS) toast("Too many tabs - close one first") else newTab(home) }))
         for ((i, t) in tabs.withIndex()) {
             val name = t.web.title?.takeIf { it.isNotBlank() } ?: t.pageUrl.ifEmpty { "New tab" }
             rows.add(Row((if (i == cur) "> " else "") + name, if (isHome(t.pageUrl)) "Favorites" else t.pageUrl, { hidePanel(); switchTo(i) }, { closeTab(i); showTabs() }))
@@ -653,6 +801,9 @@ class MainActivity : Activity() {
         customView = null
         customCallback?.onCustomViewHidden()
         customCallback = null
+        fsPointer = false
+        cursor.visibility = if (scrollMode) View.INVISIBLE else View.VISIBLE
+        try { web.requestFocus() } catch (e: Exception) { }
     }
 
     // ---------------------------------------------------------------- navigation helpers
@@ -723,6 +874,27 @@ class MainActivity : Activity() {
     override fun dispatchKeyEvent(e: KeyEvent): Boolean {
         if (currentFocus is EditText) { held.fill(false); return super.dispatchKeyEvent(e) }   // typing in the URL bar
         val down = e.action == KeyEvent.ACTION_DOWN
+
+        // Video full screen with the pointer hidden: arrows go to the player (seek / volume shortcuts),
+        // OK = play/pause, hold OK = show the pointer so on-screen buttons can be clicked.
+        if (customView != null && !fsPointer) {
+            when (e.keyCode) {
+                KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> {
+                    if (down) {
+                        if (e.repeatCount == 0) okLong = false
+                        else if (!okLong && e.repeatCount >= 2) {
+                            okLong = true; fsPointer = true; cursor.visibility = View.VISIBLE
+                            toast("Pointer on - hold OK again to hide it")
+                        }
+                    } else if (!okLong) sendKeyToPage(KeyEvent.KEYCODE_SPACE)
+                    return true
+                }
+                KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                    web.dispatchKeyEvent(e)
+                    return true
+                }
+            }
+        }
         val idx = when (e.keyCode) {
             KeyEvent.KEYCODE_DPAD_UP -> 0
             KeyEvent.KEYCODE_DPAD_DOWN -> 1
@@ -745,6 +917,8 @@ class MainActivity : Activity() {
                         } else downStartY = cursorY
                         lastDown = now
                     }
+                    if (idx == 2) { if (now - lastLeft < 350 && !scrollMode) jumpHorizontal(-1); lastLeft = now }
+                    if (idx == 3) { if (now - lastRight < 350 && !scrollMode) jumpHorizontal(1); lastRight = now }
                     startLoop()
                 }
             } else held[idx] = false
@@ -754,7 +928,11 @@ class MainActivity : Activity() {
             KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> {
                 if (down) {
                     if (e.repeatCount == 0) okLong = false
-                    else if (!okLong && e.repeatCount >= 2) { okLong = true; toggleScrollMode() }
+                    else if (!okLong && e.repeatCount >= 2) {
+                        okLong = true
+                        if (customView != null) { fsPointer = false; held.fill(false); cursor.visibility = View.GONE; toast("Pointer hidden") }
+                        else toggleScrollMode()
+                    }
                 } else if (!okLong) {
                     if (scrollMode) toggleScrollMode() else clickAtCursor()
                 }
@@ -805,6 +983,7 @@ class MainActivity : Activity() {
         if (held[1]) dy += speed(1, now) * dt
         if (held[2]) dx -= speed(2, now) * dt
         if (held[3]) dx += speed(3, now) * dt
+        if (customView != null && !fsPointer) return
         if (scrollMode) scrollContent(dx * 1.6f, dy * 1.6f) else moveCursor(dx, dy)
     }
 
@@ -823,6 +1002,7 @@ class MainActivity : Activity() {
         else if (dx < 0f && cursorX <= margin) scrollContent(dx * 1.5f, 0f)
         cursorX = nx.coerceIn(0f, w - 1f)
         cursorY = ny.coerceIn(0f, h - 1f)
+        if (edgeJump != 0 && cursorX > 120 * density && cursorX < w - 120 * density) edgeJump = 0
         cursor.setPos(cursorX, cursorY)
     }
 
@@ -844,6 +1024,27 @@ class MainActivity : Activity() {
         scrollMode = !scrollMode
         cursor.visibility = if (scrollMode) View.INVISIBLE else View.VISIBLE
         toast(if (scrollMode) "Scroll mode: arrows scroll the page. Press OK to go back to the pointer." else "Pointer mode")
+    }
+
+    private fun sendKeyToPage(code: Int) {
+        val t = SystemClock.uptimeMillis()
+        web.dispatchKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_DOWN, code, 0))
+        web.dispatchKeyEvent(KeyEvent(t, t + 40, KeyEvent.ACTION_UP, code, 0))
+    }
+
+    /** Double-tap LEFT / RIGHT: jump the pointer to that screen edge; double-tap the other way to come back. */
+    private fun jumpHorizontal(dir: Int) {
+        val w = root.width.toFloat()
+        if (w <= 0f) return
+        if (edgeJump == -dir) {
+            cursorX = savedX
+            edgeJump = 0
+        } else {
+            if (edgeJump == 0) savedX = cursorX
+            cursorX = if (dir < 0) 10 * density else w - 1f - 10 * density
+            edgeJump = dir
+        }
+        cursor.setPos(cursorX, cursorY)
     }
 
     private fun jumpToToolbar() {
@@ -910,7 +1111,7 @@ class MainActivity : Activity() {
 
     @Suppress("OVERRIDE_DEPRECATION")
     override fun onBackPressed() {
-        if (customView != null) { hideCustom(); return }
+        if (customView != null) { userExit = true; hideCustom(); userExit = false; return }
         if (panel != null) { hidePanel(); return }
         if (urlBar.hasFocus()) { hideKeyboard(); web.requestFocus(); return }
         if (scrollMode) { toggleScrollMode(); return }
@@ -925,9 +1126,19 @@ class MainActivity : Activity() {
         }
     }
 
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL && tabs.size > 1 && customView == null) {
+            trace("low memory")
+            val keep = tab
+            for (t in ArrayList(tabs)) if (t !== keep) { val i = tabs.indexOf(t); if (i >= 0) closeTab(i) }
+            toast("Low memory: closed background tabs")
+        }
+    }
+
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
-        intent?.dataString?.let { newTab(it) }
+        intent?.dataString?.let { if (tabs.size >= MAX_TABS) { tab.chainOk = true; web.loadUrl(it) } else newTab(it) }
     }
 
     override fun onResume() { super.onResume(); web.onResume(); ui.post(ticker) }

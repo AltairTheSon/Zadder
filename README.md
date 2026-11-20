@@ -13,8 +13,11 @@ Light Android TV browser: system WebView + Brave's `adblock-rust` engine (via JN
   `adb connect <tv-ip>:5555` and `adb install app-debug.apk`.
 
 ## Remote controls
-- D-pad: move the mouse pointer. Hold at the screen edge to scroll the page.
-- OK: click. Back: go back / close keyboard / exit.
-- Menu or Search key (if your remote has it): jump to the address bar.
-- Hold UP for ~1 second near the top while the page is scrolled: jump pointer to the toolbar.
-- Toolbar: Back, Fwd, Reload, Home, address bar, Ads ON/OFF (toggles blocking, shows blocked count).
+- D-pad: move the pointer smoothly (it speeds up the longer you hold). Push against the top/bottom edge to scroll.
+- OK: click. Hold OK for about a second: scroll mode (arrows scroll the page, OK returns to the pointer).
+- Double-tap UP: jump the pointer to the toolbar. Double-tap DOWN (in the toolbar): jump back.
+- Double-tap LEFT / RIGHT: jump the pointer to that screen edge; double-tap the other way to return.
+- Full screen video: the pointer hides. Arrows go to the player, OK = play/pause, hold OK = show/hide the pointer.
+- Back: close panel / go back / close tab. Press Back twice quickly for the Exit popup. Menu or Search key (if present): address bar.
+- Home page = your favorites (add sites with + Fav in the toolbar).
+- Toolbar: Back, Fwd, Reload, Home, address bar, Tabs, Favorites, +Fav, shield (Aggr / Std / OFF).
