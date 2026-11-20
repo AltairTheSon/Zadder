@@ -78,6 +78,19 @@ object AdBlock {
 
     val blockedCount = AtomicInteger(0)
 
+    // The most recent blocks (shown in the "Blocked log" tool, to see what breaks a site).
+    private val blockLog = ArrayDeque<String>()
+
+    fun note(reason: String, url: String, type: String = "") {
+        val host = hostOf(url) ?: url.take(40)
+        synchronized(blockLog) {
+            blockLog.addFirst(reason + "  " + host + (if (type.isNotEmpty()) "  (" + type + ")" else ""))
+            while (blockLog.size > 80) blockLog.removeLast()
+        }
+    }
+
+    fun recentBlocks(): List<String> = synchronized(blockLog) { blockLog.toList() }
+
     private val nativeOk: Boolean = try {
         System.loadLibrary("adblock_jni"); true
     } catch (t: Throwable) {
@@ -122,6 +135,8 @@ object AdBlock {
             prefs.edit().putBoolean("engine_loading", false).apply()
             if (lastRunDied(ctx)) {
                 prefs.edit().putBoolean("engine_died", true).apply()
+                // Whatever file the native loader choked on must never be loaded again.
+                File(ctx.filesDir, "filters").listFiles()?.filter { it.name.startsWith("engine-") }?.forEach { it.delete() }
                 onStatus("The ad-block lists ran out of memory last time. Using the small list; tap the shield to retry.")
             }
         }
@@ -136,13 +151,20 @@ object AdBlock {
             try {
                 val dir = File(ctx.filesDir, "filters").apply { mkdirs() }
                 val cache = File(dir, "engine-$set.bin")
+                val meta = File(dir, "engine-$set.meta")
                 val appStamp = try { ctx.packageManager.getPackageInfo(ctx.packageName, 0).lastUpdateTime } catch (e: Exception) { 0L }
-                val fresh = set != "lite" && cache.exists() && cache.lastModified() > appStamp &&
+                // A saved engine is only trusted if this exact install wrote it (a backup-restored or older
+                // file could crash the native loader on every start).
+                val fresh = set != "lite" && cache.exists() && meta.exists() &&
+                    meta.readText().trim() == appStamp.toString() &&
                     System.currentTimeMillis() - cache.lastModified() < MAX_AGE_MS
-                if (fresh && nativeLoadCache(cache.path)) {
-                    ok = true
-                    onStatus("Ad blocker ready ($set)")
-                } else {
+                if (fresh) {
+                    prefs.edit().putBoolean("engine_loading", true).commit()
+                    ok = nativeLoadCache(cache.path)
+                    prefs.edit().putBoolean("engine_loading", false).commit()
+                    if (ok) onStatus("Ad blocker ready ($set)") else { cache.delete(); meta.delete() }
+                }
+                if (!ok) {
                     if (set != "lite") onStatus("Building the $set ad-block lists (first start takes a minute)...")
                     val sb = StringBuilder(4_000_000)
                     if (set != "lite") {
@@ -158,7 +180,7 @@ object AdBlock {
                     prefs.edit().putBoolean("engine_loading", true).commit()   // survives a crash in the native code
                     ok = nativeLoad(text)
                     prefs.edit().putBoolean("engine_loading", false).commit()
-                    if (ok && set != "lite") nativeSaveCache(cache.path)
+                    if (ok && set != "lite" && nativeSaveCache(cache.path)) meta.writeText(appStamp.toString())
                     onStatus(if (ok) "Ad blocker ready ($set)" else "Ad blocker failed to load")
                 }
                 if (ok) loadedSet = set
@@ -331,22 +353,26 @@ object AdBlock {
 
     fun shouldBlock(url: String, source: String, type: String): Boolean {
         if (!enabled) return false
-        if (customBlocked(url)) { blockedCount.incrementAndGet(); return true }
-        if (aggressive && domainListApplies(url, source) && isThirdParty(url, source) && domainBlocked(url)) { blockedCount.incrementAndGet(); return true }
+        if (customBlocked(url)) { blockedCount.incrementAndGet(); note("your list", url, type); return true }
+        if (aggressive && domainListApplies(url, source) && isThirdParty(url, source) && domainBlocked(url)) {
+            blockedCount.incrementAndGet(); note("domain list", url, type); return true
+        }
         if (!ready) return false
         val b = nativeShouldBlock(url, source, type)
-        if (b) blockedCount.incrementAndGet()
+        if (b) { blockedCount.incrementAndGet(); note("filters", url, type) }
         return b
     }
 
     /** For main-frame navigations and popups: true if the destination looks like an ad/redirect domain. */
     fun shouldBlockNavigation(url: String, source: String): Boolean {
         if (!enabled) return false
-        if (customBlocked(url)) { blockedCount.incrementAndGet(); return true }
-        if (aggressive && domainListApplies(url, source) && isThirdParty(url, source) && domainBlocked(url)) { blockedCount.incrementAndGet(); return true }
+        if (customBlocked(url)) { blockedCount.incrementAndGet(); note("page jump (your list)", url); return true }
+        if (aggressive && domainListApplies(url, source) && isThirdParty(url, source) && domainBlocked(url)) {
+            blockedCount.incrementAndGet(); note("page jump (domain list)", url); return true
+        }
         if (!ready) return false
         for (type in arrayOf("document", "subdocument", "popup")) {
-            if (nativeShouldBlock(url, source, type)) { blockedCount.incrementAndGet(); return true }
+            if (nativeShouldBlock(url, source, type)) { blockedCount.incrementAndGet(); note("page jump (filters)", url, type); return true }
         }
         return false
     }

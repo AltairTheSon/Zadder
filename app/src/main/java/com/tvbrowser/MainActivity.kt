@@ -53,7 +53,9 @@ import androidx.webkit.WebViewFeature
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
+import java.io.File
 import java.net.URLEncoder
+import java.util.Collections
 import java.util.concurrent.Executors
 
 const val HOME_URL = "https://tvbrowser.home/"
@@ -67,6 +69,8 @@ private const val MAX_TABS = 6
  */
 private const val PAGE_JS = """
 (function(){
+ var h=location.hostname;
+ if(h==='youtube.com'||h.endsWith('.youtube.com')||h.endsWith('youtube-nocookie.com')||h==='youtu.be')return;
  if(window.__tvb)return; window.__tvb=1;
  function f(e){ if(!e.isTrusted)return; var n=e.target,a=n&&n.closest?n.closest('a[href]'):null; try{TVB.tap(a?a.href:'')}catch(x){} }
  document.addEventListener('pointerdown',f,true);
@@ -83,6 +87,17 @@ private const val PAGE_JS = """
   var a=e.target&&e.target.closest?e.target.closest('a[href]'):null;
   if(a&&(a.target==='_blank'||a.origin!==location.origin)){e.preventDefault();e.stopImmediatePropagation();}
  },true);
+ function guard(o,n){
+  var f=o&&o[n]; if(typeof f!=='function')return;
+  o[n]=function(){
+   var ok=true;
+   try{ ok=TVB.allowFsExit(String(new Error().stack||'').substring(0,240)); }catch(x){}
+   if(!ok)return (window.Promise?Promise.resolve():undefined);
+   return f.apply(this,arguments);
+  };
+ }
+ try{ guard(Document.prototype,'exitFullscreen'); guard(Document.prototype,'webkitExitFullscreen'); guard(Document.prototype,'webkitCancelFullScreen'); }catch(x){}
+ try{ guard(HTMLVideoElement.prototype,'webkitExitFullscreen'); guard(HTMLVideoElement.prototype,'webkitExitFullScreen'); }catch(x){}
 })();
 """
 
@@ -150,8 +165,28 @@ class MainActivity : Activity() {
     private var savedX = 0f
 
     // full screen video + popups
-    private var fsPointer = false     // pointer shown while a video is full screen
     private var userExit = false
+    private var lastPoke = 0L
+    private val hideCursorRun = Runnable { if (customView != null) cursor.visibility = View.GONE }
+
+    // remote control timing (TV remotes such as Samsung / HDMI-CEC deliver keys late or without repeats)
+    private var relaxed = false
+    private val dtMax: Long get() = if (relaxed) 700L else 350L
+    private val longMs: Long get() = if (relaxed) 900L else 600L
+    private val lastDownEvt = LongArray(4)
+    private var okHeld = false
+    private var lastOkDown = 0L
+    private val okLongRun = Runnable {
+        okLong = true
+        if (customView == null) toggleScrollMode()
+    }
+
+    // popups the user decided about
+    private val popupAllowDomains: MutableSet<String> = Collections.synchronizedSet(HashSet<String>())
+    private val popupBlockDomains: MutableSet<String> = Collections.synchronizedSet(HashSet<String>())
+    private var lastPromptAt = 0L
+    private var promptShowing = false
+    private var safeMode = false
     @Volatile private var lastPopupAt = 0L
     @Volatile private var popupToken = 0L
     @Volatile private var activePageUrl = ""
@@ -168,12 +203,20 @@ class MainActivity : Activity() {
     private val reMedia = Regex(".*\\.(mp4|webm|m3u8|mp3|ogg|m4a)$")
 
     private val ticker = object : Runnable {
-        override fun run() { updateShield(); ui.postDelayed(this, 1000) }
+        override fun run() { if (customView == null) updateShield(); ui.postDelayed(this, 1000) }
     }
 
     private inner class TapBridge {
         @JavascriptInterface
         fun tap(href: String?) { tapHref = href ?: ""; lastTap = SystemClock.uptimeMillis() }
+
+        @JavascriptInterface
+        fun allowFsExit(stack: String?): Boolean {
+            if (customView == null) return true          // not full screen as far as the app knows
+            val who = Regex("https?://([^/:\\s)]+)").find(stack ?: "")?.groupValues?.get(1) ?: "?"
+            trace("page called exitFullscreen ($who)")
+            return false                                  // Back exits full screen, scripts can't
+        }
 
         @JavascriptInterface
         fun allowPopup(url: String?): Boolean {
@@ -205,9 +248,46 @@ class MainActivity : Activity() {
     /** A popup is fine when it is a link you tapped, or it stays on the same site (e.g. a video player window). */
     private fun popupAllowed(url: String, opener: String): Boolean {
         if (AdBlock.mode == AdBlock.Mode.OFF) return true
-        if (AdBlock.shouldBlockNavigation(url, opener)) return false
+        if (AdBlock.shouldBlockNavigation(url, opener)) { AdBlock.note("popup (ad list)", url); return false }
         val linkTap = recentTap() && tapHref.isNotEmpty()
-        return linkTap || !isCrossSite(opener, url)
+        if (linkTap || !isCrossSite(opener, url)) return true
+        val d = baseDomain(url)
+        if (popupAllowDomains.contains(d)) return true
+        AdBlock.note("popup (other site)", url)
+        if (!popupBlockDomains.contains(d)) askPopup(url, d)
+        return false
+    }
+
+    /** A page you tapped wants a window on another site (could be a video player, could be an ad): ask once. */
+    private fun askPopup(url: String, d: String) {
+        if (!recentTap() || customView != null || promptShowing) return
+        val now = SystemClock.uptimeMillis()
+        if (now - lastPromptAt < 4000) return
+        lastPromptAt = now
+        ui.post { showPopupPrompt(url, d) }
+    }
+
+    private fun openUrlInTab(url: String) {
+        if (tabs.size >= MAX_TABS) { tab.chainOk = true; web.loadUrl(url) } else newTab(url)
+    }
+
+    private fun showPopupPrompt(url: String, d: String) {
+        if (isFinishing || promptShowing) return
+        promptShowing = true
+        val dlg = android.app.AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+            .setTitle("Open a window from $d?")
+            .setMessage("The page tried to open:\n" + url.take(110))
+            .setPositiveButton("Open") { _, _ -> openUrlInTab(url) }
+            .setNeutralButton("Always allow") { _, _ ->
+                popupAllowDomains.add(d)
+                prefs.edit().putStringSet("popup_allow", HashSet(popupAllowDomains)).apply()
+                openUrlInTab(url)
+            }
+            .setNegativeButton("Block") { _, _ -> popupBlockDomains.add(d) }
+            .create()
+        dlg.setOnDismissListener { promptShowing = false }
+        dlg.show()
+        dlg.getButton(android.app.AlertDialog.BUTTON_NEGATIVE)?.requestFocus()   // safest choice is preselected
     }
 
     /** Native fallback for windows that didn't go through the page script (e.g. from iframes without it). */
@@ -222,6 +302,20 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Safe mode: if the app died during start-up three times in a row, wipe what it caches and start light.
+        val fails = prefs.getInt("boot_fail", 0)
+        prefs.edit().putInt("boot_fail", fails + 1).commit()
+        if (fails >= 2) {
+            safeMode = true
+            try { File(filesDir, "filters").deleteRecursively() } catch (e: Exception) { }
+            try { File(applicationInfo.dataDir, "app_webview").deleteRecursively() } catch (e: Exception) { }
+            prefs.edit().putBoolean("engine_died", true).putInt("boot_fail", 0).commit()
+        }
+        ui.postDelayed({ prefs.edit().putInt("boot_fail", 0).apply() }, 15000)
+        relaxed = prefs.getBoolean("relaxed", false)
+        popupAllowDomains.addAll(prefs.getStringSet("popup_allow", emptySet()) ?: emptySet())
+
         setContentView(R.layout.activity_main)
         density = resources.displayMetrics.density
 
@@ -269,6 +363,10 @@ class MainActivity : Activity() {
         }
         AdBlock.ensureLoaded(applicationContext, ::status)
         ui.postDelayed({ reportLastProblem() }, 1500)
+        if (safeMode) ui.postDelayed({
+            showInfo("Started in safe mode",
+                "The app stopped several times while starting, so it cleared its saved ad-block data and browser data and started with only your block list. Tap the shield button to try the full lists again.")
+        }, 2500)
     }
 
     // ---------------------------------------------------------------- tabs
@@ -374,17 +472,18 @@ class MainActivity : Activity() {
                 customCallback = callback
                 root.addView(view, FrameLayout.LayoutParams(MATCH, MATCH))
                 cursor.bringToFront()
-                // Full screen video: hide the pointer (it also forced the video to be composited every frame).
-                fsPointer = false
+                // Full screen video: the pointer starts hidden, appears when you move it and hides again after 3 s.
                 held.fill(false)
+                ui.removeCallbacks(hideCursorRun)
                 cursor.visibility = View.GONE
             }
 
             override fun onHideCustomView() {
                 if (customView == null) return              // we closed it ourselves
-                if (!userExit) reportFullscreenExit()
+                val byUser = userExit
                 userExit = false
                 hideCustom()
+                if (!byUser) reportFullscreenExit()
             }
 
             override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message?): Boolean {
@@ -400,7 +499,14 @@ class MainActivity : Activity() {
                 transport.webView = nt.web
                 msg.sendToTarget()
                 if (nt.popupPending) {
-                    ui.postDelayed({ if (tabs.contains(nt) && nt.popupPending) closePopupTab(nt) }, 10000)
+                    // Players that write their page with script never make a request: show them anyway.
+                    ui.postDelayed({
+                        if (tabs.contains(nt) && nt.popupPending) {
+                            nt.popupPending = false
+                            val i = tabs.indexOf(nt)
+                            if (i >= 0) switchTo(i)
+                        }
+                    }, 1200)
                 } else {
                     ui.post { val i = tabs.indexOf(nt); if (i >= 0) switchTo(i) }
                 }
@@ -439,14 +545,19 @@ class MainActivity : Activity() {
         if (i >= 0 && tabs.size > 1) closeTab(i)
     }
 
-    /** Tells the user (and me) what happened just before a video left full screen on its own. */
+    /** Tells the user (and me) what happened around the moment a video left full screen on its own. */
     private fun reportFullscreenExit() {
-        val now = SystemClock.uptimeMillis()
-        val recent = synchronized(events) { events.filter { now - it.first < 2500 }.map { it.second } }
-        toast(
-            if (recent.isEmpty()) "Left full screen by itself (no popup or redirect seen)"
-            else "Left full screen. Just before: " + recent.joinToString(", ")
-        )
+        val t0 = SystemClock.uptimeMillis()
+        ui.postDelayed({
+            val ev = synchronized(events) {
+                events.filter { it.first >= t0 - 2500 && it.first <= t0 + 1200 }
+                    .map { (if (it.first < t0) "before: " else "after: ") + it.second }
+            }
+            toast(
+                if (ev.isEmpty()) "Left full screen by itself (nothing seen before or after)"
+                else "Left full screen. " + ev.joinToString("; ")
+            )
+        }, 1300)
     }
 
     private fun newTab(url: String?, activate: Boolean = true): Tab {
@@ -518,6 +629,11 @@ class MainActivity : Activity() {
 
     // ---------------------------------------------------------------- ad / redirect policy
 
+    private fun isCompatSite(url: String): Boolean {
+        val h = try { Uri.parse(url).host?.lowercase() } catch (e: Exception) { null } ?: return false
+        return h == "youtu.be" || h == "youtube.com" || h.endsWith(".youtube.com") || h.endsWith("youtube-nocookie.com")
+    }
+
     private fun isHome(url: String) = url.startsWith("https://tvbrowser.home")
 
     private fun homeHtml(): String {
@@ -575,6 +691,7 @@ class MainActivity : Activity() {
     }
 
     private fun notifyBlocked(text: String) {
+        if (customView != null) return          // nothing may pop up over a full screen video
         val now = SystemClock.uptimeMillis()
         if (now - lastToast < 3000) return
         lastToast = now
@@ -590,6 +707,7 @@ class MainActivity : Activity() {
         val target = req.url.toString()
         if (isHome(t.pageUrl)) { t.chainOk = true; return false }   // tapping a favorite / using the search box
         if (AdBlock.shouldBlockNavigation(target, t.pageUrl)) { trace("blocked ad redirect"); notifyBlocked("Blocked ad redirect"); return true }
+        if (isCompatSite(t.pageUrl)) { t.chainOk = true; return false }   // YouTube: only the filter lists apply
         val cross = isCrossSite(t.pageUrl, target)
         if (req.isRedirect) {
             if (AdBlock.aggressive && cross && !t.chainOk) { notifyBlocked("Blocked redirect (Aggressive shield)"); return true }
@@ -720,7 +838,44 @@ class MainActivity : Activity() {
             val name = t.web.title?.takeIf { it.isNotBlank() } ?: t.pageUrl.ifEmpty { "New tab" }
             rows.add(Row((if (i == cur) "> " else "") + name, if (isHome(t.pageUrl)) "Favorites" else t.pageUrl, { hidePanel(); switchTo(i) }, { closeTab(i); showTabs() }))
         }
+        rows.add(Row("Remote key test", "See which keys and timing your remote sends", { hidePanel(); showKeyTest() }))
+        rows.add(Row("Remote timing: " + (if (relaxed) "Relaxed" else "Standard"),
+            "Relaxed suits TV remotes that deliver keys late (Samsung, HDMI-CEC). Tap to switch.",
+            { relaxed = !relaxed; prefs.edit().putBoolean("relaxed", relaxed).putBoolean("relaxed_auto", true).apply(); showTabs() }))
+        rows.add(Row("Blocked log", "What the shield blocked recently", { hidePanel(); showBlockLog() }))
         showPanel("Tabs (${tabs.size})", rows)
+    }
+
+    private fun showBlockLog() {
+        val items = AdBlock.recentBlocks()
+        val rows = if (items.isEmpty()) listOf(Row("Nothing blocked yet", "Blocks show up here as you browse", { }))
+                   else items.map { Row(it, "", { }) }
+        showPanel("Blocked log (newest first)", rows)
+    }
+
+    private fun showKeyTest() {
+        val lines = ArrayList<String>()
+        var backAt = 0L
+        val dlg = android.app.AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+            .setTitle("Remote key test")
+            .setMessage("Press keys on your remote. Press Back twice quickly to close.")
+            .create()
+        dlg.setOnKeyListener { d, code, ev ->
+            val dev = ev.device
+            val line = KeyEvent.keyCodeToString(code).removePrefix("KEYCODE_") +
+                (if (ev.action == KeyEvent.ACTION_DOWN) " down r=" + ev.repeatCount else " up") +
+                "  [" + (dev?.name ?: ("id " + ev.deviceId)) + "]" + (if ((ev.source and 0x02000000) != 0) " HDMI" else "")
+            lines.add(0, line)
+            while (lines.size > 12) lines.removeAt(lines.size - 1)
+            dlg.setMessage("Press Back twice quickly to close.\n\n" + lines.joinToString("\n"))
+            if (code == KeyEvent.KEYCODE_BACK && ev.action == KeyEvent.ACTION_DOWN) {
+                val now = SystemClock.uptimeMillis()
+                if (now - backAt < 1200) d.dismiss()
+                backAt = now
+            }
+            true
+        }
+        dlg.show()
     }
 
     // ---------------------------------------------------------------- panel UI (tabs / favorites)
@@ -801,7 +956,7 @@ class MainActivity : Activity() {
         customView = null
         customCallback?.onCustomViewHidden()
         customCallback = null
-        fsPointer = false
+        ui.removeCallbacks(hideCursorRun)
         cursor.visibility = if (scrollMode) View.INVISIBLE else View.VISIBLE
         try { web.requestFocus() } catch (e: Exception) { }
     }
@@ -871,30 +1026,25 @@ class MainActivity : Activity() {
 
     // ---------------------------------------------------------------- remote control: smooth pointer + scrolling
 
+    private val dtMin: Long get() = if (relaxed) 150L else 90L
+
+    /** TV remotes (Samsung, HDMI-CEC) deliver keys late and without repeats: switch to relaxed timing once. */
+    private fun detectRemote(e: KeyEvent) {
+        if (relaxed || prefs.getBoolean("relaxed_auto", false)) return
+        val name = (e.device?.name ?: "").lowercase()
+        val hdmi = (e.source and 0x02000000) != 0          // key forwarded over HDMI-CEC
+        if (hdmi || name.contains("samsung") || name.contains("cec")) {
+            relaxed = true
+            prefs.edit().putBoolean("relaxed", true).putBoolean("relaxed_auto", true).apply()
+            toast("TV remote detected: relaxed key timing is on (change it under Tabs)")
+        }
+    }
+
     override fun dispatchKeyEvent(e: KeyEvent): Boolean {
         if (currentFocus is EditText) { held.fill(false); return super.dispatchKeyEvent(e) }   // typing in the URL bar
         val down = e.action == KeyEvent.ACTION_DOWN
+        detectRemote(e)
 
-        // Video full screen with the pointer hidden: arrows go to the player (seek / volume shortcuts),
-        // OK = play/pause, hold OK = show the pointer so on-screen buttons can be clicked.
-        if (customView != null && !fsPointer) {
-            when (e.keyCode) {
-                KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> {
-                    if (down) {
-                        if (e.repeatCount == 0) okLong = false
-                        else if (!okLong && e.repeatCount >= 2) {
-                            okLong = true; fsPointer = true; cursor.visibility = View.VISIBLE
-                            toast("Pointer on - hold OK again to hide it")
-                        }
-                    } else if (!okLong) sendKeyToPage(KeyEvent.KEYCODE_SPACE)
-                    return true
-                }
-                KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                    web.dispatchKeyEvent(e)
-                    return true
-                }
-            }
-        }
         val idx = when (e.keyCode) {
             KeyEvent.KEYCODE_DPAD_UP -> 0
             KeyEvent.KEYCODE_DPAD_DOWN -> 1
@@ -906,43 +1056,93 @@ class MainActivity : Activity() {
             if (down) {
                 val now = SystemClock.uptimeMillis()
                 lastBeat[idx] = now
-                if (e.repeatCount == 0) {
+                // Some remotes resend a plain "key down" while the key is held: that is a repeat, not a new press.
+                val repeatLike = e.repeatCount > 0 || (held[idx] && now - lastDownEvt[idx] < 220)
+                lastDownEvt[idx] = now
+                if (customView != null) pokeCursor()
+                if (!repeatLike) {
                     if (!held[idx]) heldSince[idx] = System.nanoTime()
                     held[idx] = true
-                    if (idx == 0) { if (now - lastUp < 350 && !scrollMode) jumpToToolbar(); lastUp = now }
+                    if (idx == 0) { if (now - lastUp in dtMin..dtMax && !scrollMode) jumpToToolbar(); lastUp = now }
                     if (idx == 1) {
                         // Double-tap DOWN while the first tap started in the toolbar: go back to where we were.
-                        if (now - lastDown < 350 && !scrollMode && downStartY <= toolbar.height) {
+                        if (now - lastDown in dtMin..dtMax && !scrollMode && downStartY <= toolbar.height) {
                             returnFromToolbar(); downStartY = Float.MAX_VALUE
                         } else downStartY = cursorY
                         lastDown = now
                     }
-                    if (idx == 2) { if (now - lastLeft < 350 && !scrollMode) jumpHorizontal(-1); lastLeft = now }
-                    if (idx == 3) { if (now - lastRight < 350 && !scrollMode) jumpHorizontal(1); lastRight = now }
+                    if (idx == 2) { if (now - lastLeft in dtMin..dtMax && !scrollMode) jumpHorizontal(-1); lastLeft = now }
+                    if (idx == 3) { if (now - lastRight in dtMin..dtMax && !scrollMode) jumpHorizontal(1); lastRight = now }
                     startLoop()
                 }
             } else held[idx] = false
             return true
         }
+
         when (e.keyCode) {
             KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> {
                 if (down) {
-                    if (e.repeatCount == 0) okLong = false
-                    else if (!okLong && e.repeatCount >= 2) {
-                        okLong = true
-                        if (customView != null) { fsPointer = false; held.fill(false); cursor.visibility = View.GONE; toast("Pointer hidden") }
-                        else toggleScrollMode()
+                    val now = SystemClock.uptimeMillis()
+                    val repeatLike = e.repeatCount > 0 || (okHeld && now - lastOkDown < 450)
+                    lastOkDown = now
+                    if (!repeatLike) {
+                        okHeld = true
+                        okLong = false
+                        ui.removeCallbacks(okLongRun)
+                        ui.postDelayed(okLongRun, longMs)          // hold OK = scroll mode (works without key repeats)
+                    } else if (e.repeatCount >= 3 && !okLong) {
+                        ui.removeCallbacks(okLongRun); okLongRun.run()
                     }
-                } else if (!okLong) {
-                    if (scrollMode) toggleScrollMode() else clickAtCursor()
+                } else {
+                    okHeld = false
+                    ui.removeCallbacks(okLongRun)
+                    if (!okLong) {
+                        if (scrollMode) toggleScrollMode()
+                        else if (customView != null && cursor.visibility != View.VISIBLE) pokeCursor()   // first OK only shows the pointer
+                        else clickAtCursor()
+                    }
                 }
                 return true
             }
-            KeyEvent.KEYCODE_MENU, KeyEvent.KEYCODE_SEARCH -> { if (down) urlBar.requestFocus(); return true }
-            KeyEvent.KEYCODE_CHANNEL_UP, KeyEvent.KEYCODE_MEDIA_REWIND -> { if (down) web.pageUp(false); return true }
-            KeyEvent.KEYCODE_CHANNEL_DOWN, KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> { if (down) web.pageDown(false); return true }
+            KeyEvent.KEYCODE_MENU, KeyEvent.KEYCODE_SEARCH, KeyEvent.KEYCODE_INFO -> { if (down && e.repeatCount == 0) urlBar.requestFocus(); return true }
+            // Coloured keys: shortcuts for gestures that some remotes can't send.
+            KeyEvent.KEYCODE_PROG_RED -> { if (down && e.repeatCount == 0) toggleScrollMode(); return true }
+            KeyEvent.KEYCODE_PROG_GREEN -> { if (down && e.repeatCount == 0) showFavs(); return true }
+            KeyEvent.KEYCODE_PROG_YELLOW -> { if (down && e.repeatCount == 0) showTabs(); return true }
+            KeyEvent.KEYCODE_PROG_BLUE -> { if (down && e.repeatCount == 0) { jumpToToolbar(); pokeCursor() }; return true }
+            // Media keys: play/pause and seek the video.
+            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_MEDIA_PLAY, KeyEvent.KEYCODE_MEDIA_PAUSE ->
+                { if (down && e.repeatCount == 0) toggleVideo(); return true }
+            KeyEvent.KEYCODE_MEDIA_REWIND -> { if (down) { if (customView != null) seekVideo(-10) else web.pageUp(false) }; return true }
+            KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> { if (down) { if (customView != null) seekVideo(10) else web.pageDown(false) }; return true }
+            KeyEvent.KEYCODE_CHANNEL_UP -> { if (down) web.pageUp(false); return true }
+            KeyEvent.KEYCODE_CHANNEL_DOWN -> { if (down) web.pageDown(false); return true }
         }
         return super.dispatchKeyEvent(e)
+    }
+
+    private fun toggleVideo() {
+        web.evaluateJavascript(
+            "(function(){var v=document.querySelector('video');if(!v)return 0;if(v.paused)v.play();else v.pause();return 1})()"
+        ) { r -> if (r != "1") sendKeyToPage(KeyEvent.KEYCODE_SPACE) }
+    }
+
+    private fun seekVideo(sec: Int) {
+        web.evaluateJavascript(
+            "(function(){var v=document.querySelector('video');if(v&&isFinite(v.duration)){v.currentTime=Math.max(0,v.currentTime+(${sec}));}})()", null
+        )
+    }
+
+    /** In full screen the pointer is hidden; it appears when moved and hides again after 3 seconds. */
+    private fun pokeCursor() {
+        if (customView == null) return
+        val now = SystemClock.uptimeMillis()
+        if (cursor.visibility != View.VISIBLE) { cursor.visibility = View.VISIBLE; lastPoke = 0L }
+        if (now - lastPoke > 250) {
+            lastPoke = now
+            ui.removeCallbacks(hideCursorRun)
+            ui.postDelayed(hideCursorRun, 3000)
+        }
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -983,7 +1183,7 @@ class MainActivity : Activity() {
         if (held[1]) dy += speed(1, now) * dt
         if (held[2]) dx -= speed(2, now) * dt
         if (held[3]) dx += speed(3, now) * dt
-        if (customView != null && !fsPointer) return
+        if (customView != null) pokeCursor()
         if (scrollMode) scrollContent(dx * 1.6f, dy * 1.6f) else moveCursor(dx, dy)
     }
 
@@ -1061,6 +1261,7 @@ class MainActivity : Activity() {
     }
 
     private fun clickAtCursor() {
+        if (customView != null) pokeCursor()
         val x = cursorX
         val y = cursorY
         val t = SystemClock.uptimeMillis()
@@ -1139,6 +1340,11 @@ class MainActivity : Activity() {
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
         intent?.dataString?.let { if (tabs.size >= MAX_TABS) { tab.chainOk = true; web.loadUrl(it) } else newTab(it) }
+    }
+
+    override fun onStop() {
+        prefs.edit().putInt("boot_fail", 0).apply()
+        super.onStop()
     }
 
     override fun onResume() { super.onResume(); web.onResume(); ui.post(ticker) }
