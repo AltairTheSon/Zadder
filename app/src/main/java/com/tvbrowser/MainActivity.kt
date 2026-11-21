@@ -17,6 +17,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.Message
+import android.os.PowerManager
 import android.os.SystemClock
 import android.text.TextUtils
 import android.util.Log
@@ -54,6 +55,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.io.File
+import java.io.FileOutputStream
 import java.net.URLEncoder
 import java.util.Collections
 import java.util.concurrent.Executors
@@ -72,21 +74,43 @@ private const val PAGE_JS = """
  var h=location.hostname;
  if(h==='youtube.com'||h.endsWith('.youtube.com')||h.endsWith('youtube-nocookie.com')||h==='youtu.be')return;
  if(window.__tvb)return; window.__tvb=1;
+ function off(){ try{ return TVB.siteOff(); }catch(x){ return false; } }
+ function inFs(){ try{ return TVB.inFs(); }catch(x){ return false; } }
  function f(e){ if(!e.isTrusted)return; var n=e.target,a=n&&n.closest?n.closest('a[href]'):null; try{TVB.tap(a?a.href:'')}catch(x){} }
  document.addEventListener('pointerdown',f,true);
  document.addEventListener('click',f,true);
  var _open=window.open;
  window.open=function(u){
+  if(off())return _open.apply(this,arguments);
   var ok=true;
   try{ var abs=''; if(u!=null&&String(u)!==''){ abs=String(u); try{abs=new URL(abs,location.href).href}catch(x){} } ok=TVB.allowPopup(abs); }catch(x){}
   if(!ok)return null;
   return _open.apply(this,arguments);
  };
  document.addEventListener('click',function(e){
-  if(e.isTrusted)return;
+  if(off())return;
   var a=e.target&&e.target.closest?e.target.closest('a[href]'):null;
-  if(a&&(a.target==='_blank'||a.origin!==location.origin)){e.preventDefault();e.stopImmediatePropagation();}
+  if(!a||!(a.target==='_blank'||a.origin!==location.origin))return;
+  if(!e.isTrusted){
+   try{TVB.noteBlock('scripted link click',a.href)}catch(x){}
+   e.preventDefault();e.stopImmediatePropagation();
+  }else if(inFs()){
+   try{TVB.noteBlock('link click in full screen',a.href)}catch(x){}
+   e.preventDefault();e.stopImmediatePropagation();
+  }
  },true);
+ document.addEventListener('submit',function(e){
+  if(!off()&&inFs()&&e.target&&e.target.target==='_blank'){e.preventDefault();e.stopImmediatePropagation();}
+ },true);
+ function remember(){var el=document.fullscreenElement||document.webkitFullscreenElement;if(el)window.__tvbFsEl=el;}
+ document.addEventListener('fullscreenchange',remember,true);
+ document.addEventListener('webkitfullscreenchange',remember,true);
+ window.__tvbReenter=function(){
+  var el=window.__tvbFsEl;
+  if(el&&el.isConnected&&!document.fullscreenElement&&!document.webkitFullscreenElement){
+   try{var p=el.requestFullscreen?el.requestFullscreen():el.webkitRequestFullscreen();if(p&&p.catch)p.catch(function(){});}catch(x){}
+  }
+ };
  function guard(o,n){
   var f=o&&o[n]; if(typeof f!=='function')return;
   o[n]=function(){
@@ -187,6 +211,15 @@ class MainActivity : Activity() {
     private var lastPromptAt = 0L
     private var promptShowing = false
     private var safeMode = false
+
+    // sites where the shield was switched off by the user (base domains, remembered)
+    private val shieldOffSites: MutableSet<String> = Collections.synchronizedSet(HashSet<String>())
+
+    private fun shieldOffFor(url: String): Boolean {
+        if (shieldOffSites.isEmpty() || url.isEmpty()) return false
+        val d = baseDomain(url)
+        return d.isNotEmpty() && shieldOffSites.contains(d)
+    }
     @Volatile private var lastPopupAt = 0L
     @Volatile private var popupToken = 0L
     @Volatile private var activePageUrl = ""
@@ -203,7 +236,11 @@ class MainActivity : Activity() {
     private val reMedia = Regex(".*\\.(mp4|webm|m3u8|mp3|ogg|m4a)$")
 
     private val ticker = object : Runnable {
-        override fun run() { if (customView == null) updateShield(); ui.postDelayed(this, 1000) }
+        override fun run() {
+            if (customView == null) updateShield()
+            if (++tick % 10 == 0) sampleSystem()
+            ui.postDelayed(this, 1000)
+        }
     }
 
     private inner class TapBridge {
@@ -211,8 +248,20 @@ class MainActivity : Activity() {
         fun tap(href: String?) { tapHref = href ?: ""; lastTap = SystemClock.uptimeMillis() }
 
         @JavascriptInterface
+        fun inFs(): Boolean = customView != null
+
+        @JavascriptInterface
+        fun siteOff(): Boolean = shieldOffFor(activePageUrl)
+
+        @JavascriptInterface
+        fun noteBlock(reason: String?, url: String?) {
+            AdBlock.note(reason ?: "blocked", url ?: "")
+            trace(reason ?: "blocked")
+        }
+
+        @JavascriptInterface
         fun allowFsExit(stack: String?): Boolean {
-            if (customView == null) return true          // not full screen as far as the app knows
+            if (customView == null || shieldOffFor(activePageUrl)) return true   // not full screen / shield off here
             val who = Regex("https?://([^/:\\s)]+)").find(stack ?: "")?.groupValues?.get(1) ?: "?"
             trace("page called exitFullscreen ($who)")
             return false                                  // Back exits full screen, scripts can't
@@ -222,12 +271,62 @@ class MainActivity : Activity() {
         fun allowPopup(url: String?): Boolean {
             val ok = popupDecision(url ?: "")
             trace(if (ok) "window.open allowed" else "window.open blocked")
+            if (!ok) AdBlock.note("window.open blocked", url ?: "")
             if (!ok) notifyBlocked("Blocked popup")
             return ok
         }
     }
 
+    /** The background worker may already be shut down while the app closes: never let that throw. */
+    private fun runBg(block: () -> Unit) {
+        try { bg.execute { try { block() } catch (e: Exception) { } } } catch (e: java.util.concurrent.RejectedExecutionException) { }
+    }
+
+    private val trailFile: File by lazy { File(filesDir, "trail.txt") }
+    private var prevTrail = ""
+    private var wasClean = true
+    private var tick = 0
+
+    /** Appended to a file (and flushed) so that after a crash or a restart of the whole box we can see what happened. */
+    private fun trail(line: String) {
+        val time = System.currentTimeMillis()
+        runBg {
+            try {
+                val stamp = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date(time))
+                FileOutputStream(trailFile, true).use { out ->
+                    out.write((stamp + " " + line + "\n").toByteArray())
+                    out.fd.sync()
+                }
+            } catch (e: Exception) { }
+        }
+    }
+
+    private fun sampleSystem() {
+        runBg {
+            try {
+                val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+                val mi = ActivityManager.MemoryInfo()
+                am.getMemoryInfo(mi)
+                val pss = am.getProcessMemoryInfo(intArrayOf(android.os.Process.myPid())).firstOrNull()?.totalPss ?: 0
+                var thermal = -1
+                if (Build.VERSION.SDK_INT >= 29) thermal = (getSystemService(Context.POWER_SERVICE) as PowerManager).currentThermalStatus
+                trail("mem free " + (mi.availMem / 1048576) + "MB low=" + mi.lowMemory + " app " + (pss / 1024) +
+                    "MB thermal=" + thermal + " tabs=" + tabs.size + " fullscreen=" + (customView != null))
+            } catch (e: Exception) { }
+        }
+    }
+
+    private fun readPrevTrail() {
+        try {
+            if (trailFile.exists()) {
+                prevTrail = trailFile.readLines().takeLast(14).joinToString("\n")
+                trailFile.delete()
+            }
+        } catch (e: Exception) { }
+    }
+
     private fun trace(what: String) {
+        trail(what)
         synchronized(events) {
             events.add(SystemClock.uptimeMillis() to what)
             while (events.size > 20) events.removeAt(0)
@@ -236,7 +335,7 @@ class MainActivity : Activity() {
 
     /** Is this URL (from window.open) a popup the user wants? Never during full screen, never in bursts. */
     private fun popupDecision(u: String): Boolean {
-        if (AdBlock.mode == AdBlock.Mode.OFF) return true
+        if (AdBlock.mode == AdBlock.Mode.OFF || shieldOffFor(activePageUrl)) return true
         if (customView != null) return false
         val now = SystemClock.uptimeMillis()
         if (now - lastPopupAt < 1500 || tabs.size >= MAX_TABS) return false
@@ -247,7 +346,7 @@ class MainActivity : Activity() {
 
     /** A popup is fine when it is a link you tapped, or it stays on the same site (e.g. a video player window). */
     private fun popupAllowed(url: String, opener: String): Boolean {
-        if (AdBlock.mode == AdBlock.Mode.OFF) return true
+        if (AdBlock.mode == AdBlock.Mode.OFF || shieldOffFor(opener)) return true
         if (AdBlock.shouldBlockNavigation(url, opener)) { AdBlock.note("popup (ad list)", url); return false }
         val linkTap = recentTap() && tapHref.isNotEmpty()
         if (linkTap || !isCrossSite(opener, url)) return true
@@ -292,7 +391,7 @@ class MainActivity : Activity() {
 
     /** Native fallback for windows that didn't go through the page script (e.g. from iframes without it). */
     private fun admitPopup(): Boolean {
-        if (AdBlock.mode == AdBlock.Mode.OFF) return true
+        if (AdBlock.mode == AdBlock.Mode.OFF || shieldOffFor(activePageUrl)) return true
         val now = SystemClock.uptimeMillis()
         if (now <= popupToken) { popupToken = 0L; return true }
         if (customView != null || tabs.size >= MAX_TABS || now - lastPopupAt < 1500) return false
@@ -313,8 +412,13 @@ class MainActivity : Activity() {
             prefs.edit().putBoolean("engine_died", true).putInt("boot_fail", 0).commit()
         }
         ui.postDelayed({ prefs.edit().putInt("boot_fail", 0).apply() }, 15000)
+        wasClean = prefs.getBoolean("clean_exit", true)
+        prefs.edit().putBoolean("clean_exit", false).commit()
+        readPrevTrail()
+        trail("app start (safe mode=$safeMode)")
         relaxed = prefs.getBoolean("relaxed", false)
         popupAllowDomains.addAll(prefs.getStringSet("popup_allow", emptySet()) ?: emptySet())
+        shieldOffSites.addAll(prefs.getStringSet("site_off", emptySet()) ?: emptySet())
 
         setContentView(R.layout.activity_main)
         density = resources.displayMetrics.density
@@ -416,6 +520,7 @@ class MainActivity : Activity() {
                 }
                 if (request.isForMainFrame) return null
                 if (!url.startsWith("http")) return null
+                if (shieldOffFor(t.pageUrl)) return null
                 val source = t.pageUrl.ifEmpty { url }
                 return if (AdBlock.shouldBlock(url, source, guessType(request)))
                     WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
@@ -435,6 +540,7 @@ class MainActivity : Activity() {
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 t.pageUrl = url ?: ""
                 t.lastCosmetic = ""
+                trail("page " + (try { Uri.parse(t.pageUrl).host ?: "" } catch (e: Exception) { "" }))
                 if (t === tab) {
                     activePageUrl = t.pageUrl
                     if (!urlBar.hasFocus()) urlBar.setText(if (isHome(t.pageUrl)) "" else t.pageUrl)
@@ -448,6 +554,7 @@ class MainActivity : Activity() {
             }
 
             override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
+                trail("WebView process gone (crashed=" + (detail?.didCrash() ?: false) + ")")
                 ui.post { recoverTab(t) }
                 return true
             }
@@ -470,6 +577,7 @@ class MainActivity : Activity() {
                 if (view == null) return
                 customView = view
                 customCallback = callback
+                trail("full screen ON")
                 root.addView(view, FrameLayout.LayoutParams(MATCH, MATCH))
                 cursor.bringToFront()
                 // Full screen video: the pointer starts hidden, appears when you move it and hides again after 3 s.
@@ -483,7 +591,10 @@ class MainActivity : Activity() {
                 val byUser = userExit
                 userExit = false
                 hideCustom()
-                if (!byUser) reportFullscreenExit()
+                if (!byUser) {
+                    reportFullscreenExit()
+                    ui.postDelayed({ tryReenterFullscreen() }, 300)
+                }
             }
 
             override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message?): Boolean {
@@ -543,6 +654,17 @@ class MainActivity : Activity() {
     private fun closePopupTab(t: Tab) {
         val i = tabs.indexOf(t)
         if (i >= 0 && tabs.size > 1) closeTab(i)
+    }
+
+    private var lastReenter = 0L
+
+    /** A tap just before the exit gives the page permission to go full screen again: put the player back. */
+    private fun tryReenterFullscreen() {
+        val now = SystemClock.uptimeMillis()
+        if (customView != null || now - lastReenter < 10000 || now - lastTap > 4500) return
+        lastReenter = now
+        trail("trying to re-enter full screen")
+        try { web.evaluateJavascript("window.__tvbReenter&&window.__tvbReenter()", null) } catch (e: Exception) { }
     }
 
     /** Tells the user (and me) what happened around the moment a video left full screen on its own. */
@@ -705,7 +827,10 @@ class MainActivity : Activity() {
      */
     private fun blockNavigation(t: Tab, req: WebResourceRequest): Boolean {
         val target = req.url.toString()
-        if (isHome(t.pageUrl)) { t.chainOk = true; return false }   // tapping a favorite / using the search box
+        if (isHome(t.pageUrl) || shieldOffFor(t.pageUrl)) { t.chainOk = true; return false }   // favorites / search box / shield off
+        if (customView != null && isCrossSite(t.pageUrl, target)) {      // a page jumping away while a video is full screen
+            trace("blocked page jump in full screen"); AdBlock.note("page jump in full screen", target); return true
+        }
         if (AdBlock.shouldBlockNavigation(target, t.pageUrl)) { trace("blocked ad redirect"); notifyBlocked("Blocked ad redirect"); return true }
         if (isCompatSite(t.pageUrl)) { t.chainOk = true; return false }   // YouTube: only the filter lists apply
         val cross = isCrossSite(t.pageUrl, target)
@@ -745,10 +870,10 @@ class MainActivity : Activity() {
 
     /** Looks the hide-rules up on a background thread (they can be slow) and injects them on the UI thread. */
     private fun injectCosmetic(t: Tab, url: String?) {
-        if (url == null || !url.startsWith("http") || isHome(url) || !AdBlock.enabled) return
+        if (url == null || !url.startsWith("http") || isHome(url) || !AdBlock.enabled || shieldOffFor(url)) return
         if (t.lastCosmetic == url) return
         t.lastCosmetic = url
-        bg.execute {
+        runBg {
             val css = AdBlock.cosmeticCss(url)
             if (css.isNotEmpty()) {
                 val js = "(function(){try{var s=document.querySelector('style[data-tvb]');" +
@@ -769,6 +894,7 @@ class MainActivity : Activity() {
             AdBlock.Mode.OFF -> AdBlock.Mode.AGGRESSIVE
         }
         prefs.edit().putInt("mode", AdBlock.mode.ordinal).apply()
+        trail("shield mode " + AdBlock.mode.name)
         AdBlock.resetFailure(applicationContext)
         AdBlock.ensureLoaded(applicationContext, ::status)
         toast("Shield: " + AdBlock.mode.name.lowercase())
@@ -779,6 +905,7 @@ class MainActivity : Activity() {
     private fun updateShield() {
         val n = AdBlock.blockedCount.get()
         shield.text = when {
+            AdBlock.mode != AdBlock.Mode.OFF && shieldOffFor(tab.pageUrl) -> "Site: OFF"
             AdBlock.mode == AdBlock.Mode.OFF -> "Shield: OFF"
             !AdBlock.ready -> "Shield: loading"
             AdBlock.aggressive && AdBlock.domainCount == 0 -> "Aggr: loading"
@@ -838,6 +965,18 @@ class MainActivity : Activity() {
             val name = t.web.title?.takeIf { it.isNotBlank() } ?: t.pageUrl.ifEmpty { "New tab" }
             rows.add(Row((if (i == cur) "> " else "") + name, if (isHome(t.pageUrl)) "Favorites" else t.pageUrl, { hidePanel(); switchTo(i) }, { closeTab(i); showTabs() }))
         }
+        val dom = if (isHome(tab.pageUrl)) "" else baseDomain(tab.pageUrl)
+        if (dom.isNotEmpty()) {
+            val isOff = shieldOffSites.contains(dom)
+            rows.add(Row("Shield on $dom: " + (if (isOff) "OFF" else "ON"),
+                "Turn it off if a video player, login or menu on this site doesn't work. Tap to switch.",
+                {
+                    if (isOff) shieldOffSites.remove(dom) else shieldOffSites.add(dom)
+                    prefs.edit().putStringSet("site_off", HashSet(shieldOffSites)).apply()
+                    trail("shield " + (if (isOff) "on" else "off") + " for " + dom)
+                    hidePanel(); web.reload()
+                }))
+        }
         rows.add(Row("Remote key test", "See which keys and timing your remote sends", { hidePanel(); showKeyTest() }))
         rows.add(Row("Remote timing: " + (if (relaxed) "Relaxed" else "Standard"),
             "Relaxed suits TV remotes that deliver keys late (Samsung, HDMI-CEC). Tap to switch.",
@@ -848,8 +987,13 @@ class MainActivity : Activity() {
 
     private fun showBlockLog() {
         val items = AdBlock.recentBlocks()
-        val rows = if (items.isEmpty()) listOf(Row("Nothing blocked yet", "Blocks show up here as you browse", { }))
-                   else items.map { Row(it, "", { }) }
+        val ver = if (Build.VERSION.SDK_INT >= 26) (WebView.getCurrentWebViewPackage()?.versionName ?: "?") else "?"
+        val head = Row("WebView $ver",
+            if (tab.docStart) "Page script runs on every frame" else "Page script runs on the main page only (old WebView)", { })
+        val rows = ArrayList<Row>()
+        rows.add(head)
+        if (items.isEmpty()) rows.add(Row("Nothing blocked yet", "Blocks show up here as you browse", { }))
+        else for (it in items) rows.add(Row(it, "", { }))
         showPanel("Blocked log (newest first)", rows)
     }
 
@@ -952,6 +1096,7 @@ class MainActivity : Activity() {
     }
 
     private fun hideCustom() {
+        trail("full screen OFF")
         customView?.let { root.removeView(it) }
         customView = null
         customCallback?.onCustomViewHidden()
@@ -980,43 +1125,43 @@ class MainActivity : Activity() {
             .setTitle(title).setMessage(text).setPositiveButton("OK", null).show()
     }
 
-    /** After a crash or a system kill, tell the user why (this also tells me what to fix). */
+    /** After a crash, a system kill or even a restart of the whole box, tell the user what we know. */
     private fun reportLastProblem() {
+        var title: String? = null
+        val sb = StringBuilder()
         val saved = prefs.getString("last_crash", null)
         if (saved != null) {
             prefs.edit().remove("last_crash").apply()
-            showInfo("The app crashed last time", saved)
-            return
+            title = "The app crashed last time"
+            sb.append(saved).append('\n')
+        } else if (Build.VERSION.SDK_INT >= 30) {
+            try {
+                val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+                val last = am.getHistoricalProcessExitReasons(packageName, 0, 1).firstOrNull()
+                if (last != null && last.timestamp > prefs.getLong("exit_seen", 0L)) {
+                    prefs.edit().putLong("exit_seen", last.timestamp).apply()
+                    val name = when (last.reason) {
+                        ApplicationExitInfo.REASON_LOW_MEMORY -> "the system killed it (low memory)"
+                        ApplicationExitInfo.REASON_CRASH -> "it crashed"
+                        ApplicationExitInfo.REASON_CRASH_NATIVE -> "it crashed (native code)"
+                        ApplicationExitInfo.REASON_ANR -> "it stopped responding (ANR)"
+                        ApplicationExitInfo.REASON_SIGNALED -> "the system stopped it"
+                        ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> "it used too many resources"
+                        else -> null
+                    }
+                    if (name != null) {
+                        title = "Last time $name"
+                        sb.append(last.description ?: "").append("\nMemory used: ").append(last.rss / 1024).append(" MB\n")
+                    }
+                }
+            } catch (e: Exception) { }
         }
-        if (Build.VERSION.SDK_INT < 30) return
-        try {
-            val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-            val last = am.getHistoricalProcessExitReasons(packageName, 0, 1).firstOrNull() ?: return
-            if (last.timestamp <= prefs.getLong("exit_seen", 0L)) return
-            prefs.edit().putLong("exit_seen", last.timestamp).apply()
-            val name = when (last.reason) {
-                ApplicationExitInfo.REASON_LOW_MEMORY -> "the system killed it (low memory)"
-                ApplicationExitInfo.REASON_CRASH -> "it crashed"
-                ApplicationExitInfo.REASON_CRASH_NATIVE -> "it crashed (native code)"
-                ApplicationExitInfo.REASON_ANR -> "it stopped responding (ANR)"
-                ApplicationExitInfo.REASON_SIGNALED -> "the system stopped it"
-                ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> "it used too many resources"
-                else -> return
-            }
-            var text = (last.description ?: "") + "\nMemory used: " + (last.rss / 1024) + " MB"
-            if (last.reason == ApplicationExitInfo.REASON_ANR) {
-                try {
-                    val trace = last.traceInputStream?.bufferedReader()?.use { r ->
-                        val buf = CharArray(6000)
-                        val n = r.read(buf)
-                        if (n > 0) String(buf, 0, n) else ""
-                    } ?: ""
-                    val at = trace.indexOf("\"main\" prio")
-                    text += "\n" + (if (at >= 0) trace.substring(at) else trace).take(800)
-                } catch (e: Exception) { }
-            }
-            showInfo("Last time $name", text.take(1100))
-        } catch (e: Exception) { }
+        // The app did not close normally and there is no other explanation: probably the whole box restarted.
+        if (!wasClean && prevTrail.isNotEmpty()) {
+            if (title == null) title = "The app or the TV box stopped unexpectedly"
+            sb.append("\nLast events before it stopped:\n").append(prevTrail)
+        }
+        if (title != null) showInfo(title, sb.toString().take(1600))
     }
 
     private fun status(msg: String) { runOnUiThread { toast(msg) } }
@@ -1329,6 +1474,7 @@ class MainActivity : Activity() {
 
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
+        trail("low memory signal level=$level")
         if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL && tabs.size > 1 && customView == null) {
             trace("low memory")
             val keep = tab
@@ -1342,8 +1488,14 @@ class MainActivity : Activity() {
         intent?.dataString?.let { if (tabs.size >= MAX_TABS) { tab.chainOk = true; web.loadUrl(it) } else newTab(it) }
     }
 
+    override fun onStart() {
+        super.onStart()
+        prefs.edit().putBoolean("clean_exit", false).apply()
+    }
+
     override fun onStop() {
-        prefs.edit().putInt("boot_fail", 0).apply()
+        prefs.edit().putInt("boot_fail", 0).putBoolean("clean_exit", true).apply()
+        trail("app stopped normally")
         super.onStop()
     }
 
