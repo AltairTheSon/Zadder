@@ -63,6 +63,131 @@ import java.util.concurrent.Executors
 const val HOME_URL = "https://tvbrowser.home/"
 private const val MAX_TABS = 6
 
+/** Focus navigation ("magnetic" mode): highlights the next button / card / input in the arrow direction. */
+private const val NAV_JS = """
+(function(){
+ if(window.__tvbNav&&window.__tvbNav.v===1)return;
+ var ring=null,cur=null,cache=null,cacheAt=0;
+ var SEL='a[href],button,input:not([type=hidden]),select,textarea,summary,iframe,video,'+
+  '[role=button],[role=link],[role=tab],[role=menuitem],[role=option],[role=checkbox],[role=switch],[role=slider],[role=radio],'+
+  '[onclick],[tabindex]:not([tabindex="-1"]),[contenteditable=""],[contenteditable=true],label[for]';
+ function ovl(a1,a2,b1,b2){return Math.max(0,Math.min(a2,b2)-Math.max(a1,b1));}
+ function inView(r){return !(r.bottom<0||r.top>innerHeight||r.right<0||r.left>innerWidth);}
+ function vis(el,r){
+  if(r.width<6||r.height<6||!inView(r))return false;
+  var cs=getComputedStyle(el);
+  if(cs.visibility==='hidden'||cs.display==='none'||parseFloat(cs.opacity)<0.05||cs.pointerEvents==='none')return false;
+  return true;
+ }
+ function hit(el,r){
+  var x=Math.min(Math.max(r.left+r.width/2,1),innerWidth-1),y=Math.min(Math.max(r.top+r.height/2,1),innerHeight-1);
+  var t=document.elementFromPoint(x,y);
+  return !!t&&(t===el||el.contains(t)||t.contains(el));
+ }
+ function isCtl(el){var t=el.tagName;return t==='A'||t==='BUTTON'||t==='INPUT'||t==='SELECT'||t==='TEXTAREA'||t==='SUMMARY'||t==='IFRAME'||t==='VIDEO';}
+ function collect(){
+  var now=Date.now();if(cache&&now-cacheAt<200)return cache;
+  var list=[],set=new Set(),nodes=document.querySelectorAll(SEL),i,el,r;
+  for(i=0;i<nodes.length&&list.length<500;i++){el=nodes[i];r=el.getBoundingClientRect();if(!vis(el,r))continue;set.add(el);list.push({el:el,r:r});}
+  var more=document.querySelectorAll('div,span,li,img,svg,figure,h1,h2,h3,p'),n=0;
+  for(i=0;i<more.length&&n<1500;i++){
+   el=more[i];if(set.has(el))continue;n++;
+   r=el.getBoundingClientRect();if(r.width<10||r.height<10||!inView(r))continue;
+   var cs=getComputedStyle(el);if(cs.cursor!=='pointer'||cs.visibility==='hidden'||cs.display==='none'||parseFloat(cs.opacity)<0.05)continue;
+   var p=el.parentElement;if(p&&getComputedStyle(p).cursor==='pointer')continue;
+   set.add(el);list.push({el:el,r:r});
+  }
+  var out=[];
+  list.forEach(function(c){
+   if(!hit(c.el,c.r))return;
+   var skip=false,a=c.el.parentElement;
+   while(a){if(set.has(a)&&isCtl(a)&&a.tagName!=='IFRAME'){skip=true;break;}a=a.parentElement;}
+   if(skip)return;
+   if(!isCtl(c.el)){for(var k=0;k<list.length;k++){var o=list[k].el;if(o!==c.el&&c.el.contains(o)&&hit(o,list[k].r)){skip=true;break;}}}
+   if(!skip)out.push(c);
+  });
+  cache=out;cacheAt=now;return out;
+ }
+ function mk(){
+  if(!ring){
+   ring=document.createElement('div');ring.id='__tvb_ring';
+   ring.style.cssText='position:fixed;z-index:2147483647;pointer-events:none;box-sizing:border-box;border:3px solid #00e5ff;border-radius:8px;box-shadow:0 0 0 2px rgba(0,0,0,.65),0 0 16px 3px rgba(0,229,255,.75);display:none';
+  }
+ }
+ function place(){
+  if(!ring)return;
+  if(!cur||!cur.isConnected){ring.style.display='none';return;}
+  var d=cur.closest?cur.closest('dialog[open]'):null,host=d||document.documentElement;
+  if(ring.parentNode!==host)host.appendChild(ring);
+  var r=cur.getBoundingClientRect();
+  ring.style.display='block';ring.style.left=(r.left-3)+'px';ring.style.top=(r.top-3)+'px';
+  ring.style.width=(r.width+6)+'px';ring.style.height=(r.height+6)+'px';
+ }
+ function setCur(el){cur=el;mk();try{el.scrollIntoView({block:'nearest',inline:'nearest'});}catch(e){}place();}
+ function nearestCenter(list){
+  var cx=innerWidth/2,cy=innerHeight/2,best=null,bd=1e18;
+  list.forEach(function(c){var x=c.r.left+c.r.width/2,y=c.r.top+c.r.height/2,d=(x-cx)*(x-cx)+(y-cy)*(y-cy);if(d<bd){bd=d;best=c;}});
+  return best;
+ }
+ function pick(dir,from,list){
+  var cx=from.left+from.width/2,cy=from.top+from.height/2,best=null,bs=1e18;
+  list.forEach(function(c){
+   if(c.el===cur)return;
+   var r=c.r,x=r.left+r.width/2,y=r.top+r.height/2,dx=x-cx,dy=y-cy,p,s,ov,ok;
+   if(dir==='right'){ok=dx>4&&r.right>from.right-2;p=dx;s=Math.abs(dy);ov=ovl(r.top,r.bottom,from.top,from.bottom);}
+   else if(dir==='left'){ok=dx<-4&&r.left<from.left+2;p=-dx;s=Math.abs(dy);ov=ovl(r.top,r.bottom,from.top,from.bottom);}
+   else if(dir==='down'){ok=dy>4&&r.bottom>from.bottom-2;p=dy;s=Math.abs(dx);ov=ovl(r.left,r.right,from.left,from.right);}
+   else{ok=dy<-4&&r.top<from.top+2;p=-dy;s=Math.abs(dx);ov=ovl(r.left,r.right,from.left,from.right);}
+   if(!ok)return;
+   var score=p+2.2*s-0.7*ov;if(score<bs){bs=score;best=c;}
+  });
+  return best;
+ }
+ function scrollable(el,vert){
+  while(el&&el!==document.body&&el!==document.documentElement){
+   var cs=getComputedStyle(el),o=vert?cs.overflowY:cs.overflowX;
+   if((o==='auto'||o==='scroll')&&(vert?el.scrollHeight>el.clientHeight+2:el.scrollWidth>el.clientWidth+2))return el;
+   el=el.parentElement;
+  }
+  return null;
+ }
+ function scrollDir(dir){
+  var vert=(dir==='up'||dir==='down'),sgn=(dir==='down'||dir==='right')?1:-1,amt=sgn*(vert?innerHeight:innerWidth)*0.6,before;
+  var sc=cur?scrollable(cur,vert):null;
+  if(sc){before=vert?sc.scrollTop:sc.scrollLeft;if(vert)sc.scrollTop+=amt;else sc.scrollLeft+=amt;if((vert?sc.scrollTop:sc.scrollLeft)!==before)return true;}
+  before=vert?window.scrollY:window.scrollX;window.scrollBy(vert?0:amt,vert?amt:0);
+  return (vert?window.scrollY:window.scrollX)!==before;
+ }
+ function nav(dir){
+  cache=null;
+  var list=collect();
+  if(!list.length){if(scrollDir(dir))return 'scrolled';return dir==='up'?'edge':'none';}
+  if(!cur||!cur.isConnected){var c0=nearestCenter(list);setCur(c0.el);return 'moved';}
+  var next=pick(dir,cur.getBoundingClientRect(),list);
+  if(next){setCur(next.el);return 'moved';}
+  if(scrollDir(dir)){
+   cache=null;list=collect();
+   next=pick(dir,cur.getBoundingClientRect(),list);
+   if(next){setCur(next.el);return 'moved';}
+   place();return 'scrolled';
+  }
+  return dir==='up'?'edge':'none';
+ }
+ function ok(){
+  if(!cur||!cur.isConnected)return 'none';
+  var r=cur.getBoundingClientRect(),t=cur.tagName.toLowerCase();
+  var x=Math.min(Math.max(r.left+r.width/2,1),innerWidth-1),y=Math.min(Math.max(r.top+r.height/2,1),innerHeight-1);
+  var kind=(t==='iframe'||t==='video')?t:((t==='input'||t==='textarea'||t==='select'||cur.isContentEditable)?'input':'other');
+  return kind+'|'+x+'|'+y+'|'+document.documentElement.clientWidth;
+ }
+ function off(){cur=null;cache=null;if(ring&&ring.parentNode)ring.parentNode.removeChild(ring);ring=null;}
+ var raf=0;function later(){if(raf)return;raf=requestAnimationFrame(function(){raf=0;place();});}
+ window.addEventListener('scroll',later,true);window.addEventListener('resize',later,true);
+ window.__tvbNav=function(a){try{if(a==='ok')return ok();if(a==='off'){off();return 'off';}return nav(a);}catch(e){return 'err';}};
+ window.__tvbNav.v=1;
+})();
+"""
+
 /**
  * Runs at the start of every page and frame (when the WebView supports it).
  * - remembers real (trusted) taps, so scripted clicks can't pass as the user
@@ -122,6 +247,16 @@ private const val PAGE_JS = """
  }
  try{ guard(Document.prototype,'exitFullscreen'); guard(Document.prototype,'webkitExitFullscreen'); guard(Document.prototype,'webkitCancelFullScreen'); }catch(x){}
  try{ guard(HTMLVideoElement.prototype,'webkitExitFullscreen'); guard(HTMLVideoElement.prototype,'webkitExitFullScreen'); }catch(x){}
+ function noteFs(t){ try{TVB.noteFs(t)}catch(x){} }
+ document.addEventListener('fullscreenchange',function(){ if(!document.fullscreenElement&&!document.webkitFullscreenElement)noteFs('page saw full screen end'); },true);
+ document.addEventListener('visibilitychange',function(){ if(inFs())noteFs('visibility '+document.visibilityState); },true);
+ window.addEventListener('pagehide',function(){ if(inFs())noteFs('pagehide'); },true);
+ window.addEventListener('beforeunload',function(){ if(inFs())noteFs('beforeunload'); },true);
+ window.addEventListener('blur',function(){ if(inFs())noteFs('window blur'); },true);
+ var _al=window.alert,_co=window.confirm,_pr=window.prompt;
+ window.alert=function(){ if(!off()&&inFs()){noteFs('alert() refused');return;} return _al.apply(this,arguments); };
+ window.confirm=function(){ if(!off()&&inFs()){noteFs('confirm() refused');return false;} return _co.apply(this,arguments); };
+ window.prompt=function(){ if(!off()&&inFs()){noteFs('prompt() refused');return null;} return _pr.apply(this,arguments); };
 })();
 """
 
@@ -202,7 +337,7 @@ class MainActivity : Activity() {
     private var lastOkDown = 0L
     private val okLongRun = Runnable {
         okLong = true
-        if (customView == null) toggleScrollMode()
+        if (customView == null && !navMode) toggleScrollMode()
     }
 
     // popups the user decided about
@@ -211,6 +346,17 @@ class MainActivity : Activity() {
     private var lastPromptAt = 0L
     private var promptShowing = false
     private var safeMode = false
+
+    // navigation mode: pointer (free cursor) or focus (jump from button to card to input, like a TV app)
+    private var navMode = false
+    private var toolbarFocus = -1
+    private lateinit var btnNav: TextView
+    private lateinit var toolbarItems: List<View>
+    private val toolbarBg = HashMap<View, android.graphics.drawable.Drawable?>()
+    private var lastNavAt = 0L
+    private var okCount = 0
+    private var lastOkUp = 0L
+    private var pendingOk: Runnable? = null
 
     // sites where the shield was switched off by the user (base domains, remembered)
     private val shieldOffSites: MutableSet<String> = Collections.synchronizedSet(HashSet<String>())
@@ -254,6 +400,9 @@ class MainActivity : Activity() {
         fun siteOff(): Boolean = shieldOffFor(activePageUrl)
 
         @JavascriptInterface
+        fun noteFs(what: String?) { trace("page: " + (what ?: "?")) }
+
+        @JavascriptInterface
         fun noteBlock(reason: String?, url: String?) {
             AdBlock.note(reason ?: "blocked", url ?: "")
             trace(reason ?: "blocked")
@@ -284,6 +433,7 @@ class MainActivity : Activity() {
 
     private val trailFile: File by lazy { File(filesDir, "trail.txt") }
     private var prevTrail = ""
+    private var lastSyncAt = 0L
     private var wasClean = true
     private var tick = 0
 
@@ -295,7 +445,7 @@ class MainActivity : Activity() {
                 val stamp = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date(time))
                 FileOutputStream(trailFile, true).use { out ->
                     out.write((stamp + " " + line + "\n").toByteArray())
-                    out.fd.sync()
+                    if (time - lastSyncAt > 4000) { out.fd.sync(); lastSyncAt = time }
                 }
             } catch (e: Exception) { }
         }
@@ -323,6 +473,13 @@ class MainActivity : Activity() {
                 trailFile.delete()
             }
         } catch (e: Exception) { }
+    }
+
+    /** Embedded players (iframes from other sites) often need cookies; Aggressive keeps third-party cookies off. */
+    private fun cookiesFor(url: String): Boolean = !AdBlock.aggressive || shieldOffFor(url) || isCompatSite(url)
+
+    private fun applyCookiePolicy(w: WebView, url: String = "") {
+        try { android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(w, cookiesFor(url)) } catch (e: Exception) { }
     }
 
     private fun trace(what: String) {
@@ -417,6 +574,7 @@ class MainActivity : Activity() {
         readPrevTrail()
         trail("app start (safe mode=$safeMode)")
         relaxed = prefs.getBoolean("relaxed", false)
+        exitReports = (prefs.getString("fs_exits", "") ?: "").split("\u0001").filter { it.isNotBlank() }.toMutableList()
         popupAllowDomains.addAll(prefs.getStringSet("popup_allow", emptySet()) ?: emptySet())
         shieldOffSites.addAll(prefs.getStringSet("site_off", emptySet()) ?: emptySet())
 
@@ -432,6 +590,11 @@ class MainActivity : Activity() {
         shield = findViewById(R.id.btnShield)
         btnTabs = findViewById(R.id.btnTabs)
         btnFav = findViewById(R.id.btnFav)
+        btnNav = findViewById(R.id.btnNav)
+        toolbarItems = listOf(
+            findViewById(R.id.btnBack), findViewById(R.id.btnFwd), findViewById(R.id.btnReload), findViewById(R.id.btnHome),
+            urlBar, btnTabs, findViewById(R.id.btnFavs), btnFav, shield, btnNav
+        )
 
         AdBlock.mode = AdBlock.Mode.values().getOrElse(prefs.getInt("mode", 1)) { AdBlock.Mode.STANDARD }
 
@@ -449,6 +612,9 @@ class MainActivity : Activity() {
         findViewById<View>(R.id.btnFavs).setOnClickListener { showFavs() }
         btnFav.setOnClickListener { toggleFav() }
         shield.setOnClickListener { cycleShield() }
+        navMode = prefs.getBoolean("nav_focus", false)
+        btnNav.setOnClickListener { toggleNavMode() }
+        updateNavButton()
 
         urlBar.setOnEditorActionListener { v, actionId, _ ->
             if (actionId == EditorInfo.IME_ACTION_GO || actionId == EditorInfo.IME_ACTION_DONE) {
@@ -464,6 +630,7 @@ class MainActivity : Activity() {
             cursorX = root.width / 2f
             cursorY = root.height / 2f
             cursor.setPos(cursorX, cursorY)
+            if (navMode) cursor.visibility = View.GONE
         }
         AdBlock.ensureLoaded(applicationContext, ::status)
         ui.postDelayed({ reportLastProblem() }, 1500)
@@ -489,6 +656,7 @@ class MainActivity : Activity() {
         s.userAgentString =
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$chrome Safari/537.36"
         w.isFocusable = true
+        applyCookiePolicy(w)
         w.addJavascriptInterface(TapBridge(), "TVB")
         try {
             if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
@@ -520,7 +688,7 @@ class MainActivity : Activity() {
                 }
                 if (request.isForMainFrame) return null
                 if (!url.startsWith("http")) return null
-                if (shieldOffFor(t.pageUrl)) return null
+                if (shieldOffFor(t.pageUrl) || isCompatSite(t.pageUrl)) return null   // YouTube: filters never touch playback
                 val source = t.pageUrl.ifEmpty { url }
                 return if (AdBlock.shouldBlock(url, source, guessType(request)))
                     WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
@@ -540,7 +708,9 @@ class MainActivity : Activity() {
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 t.pageUrl = url ?: ""
                 t.lastCosmetic = ""
+                applyCookiePolicy(t.web, t.pageUrl)
                 trail("page " + (try { Uri.parse(t.pageUrl).host ?: "" } catch (e: Exception) { "" }))
+                if (customView != null) trace("page navigation started")
                 if (t === tab) {
                     activePageUrl = t.pageUrl
                     if (!urlBar.hasFocus()) urlBar.setText(if (isHome(t.pageUrl)) "" else t.pageUrl)
@@ -551,6 +721,14 @@ class MainActivity : Activity() {
 
             override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
                 if (request != null && request.isForMainFrame && isHome(request.url.toString())) ui.post { t.web.loadUrl(home) }
+                else if (request != null) AdBlock.note("load error " + (error?.description ?: ""), request.url.toString())
+            }
+
+            override fun onReceivedHttpError(view: WebView?, request: WebResourceRequest?, errorResponse: WebResourceResponse?) {
+                val code = errorResponse?.statusCode ?: return
+                val u = request?.url?.toString() ?: return
+                if (code == 404 && Regex(".*\\.(png|jpe?g|gif|webp|svg|ico|woff2?|css)$").matches(request.url.path?.lowercase() ?: "")) return
+                if (code >= 400) AdBlock.note("HTTP $code", u, if (request.isForMainFrame) "page" else "")
             }
 
             override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
@@ -559,11 +737,12 @@ class MainActivity : Activity() {
                 return true
             }
 
-            override fun onPageCommitVisible(view: WebView?, url: String?) { injectBridge(t); injectCosmetic(t, url) }
+            override fun onPageCommitVisible(view: WebView?, url: String?) { injectBridge(t); injectCosmetic(t, url); injectNav(t) }
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 injectBridge(t)
                 injectCosmetic(t, url)
+                injectNav(t)
                 if (t === tab) { progress.visibility = View.GONE; updateFavButton() }
             }
         }
@@ -657,6 +836,7 @@ class MainActivity : Activity() {
     }
 
     private var lastReenter = 0L
+    private var exitReports: MutableList<String> = ArrayList()
 
     /** A tap just before the exit gives the page permission to go full screen again: put the player back. */
     private fun tryReenterFullscreen() {
@@ -675,10 +855,12 @@ class MainActivity : Activity() {
                 events.filter { it.first >= t0 - 2500 && it.first <= t0 + 1200 }
                     .map { (if (it.first < t0) "before: " else "after: ") + it.second }
             }
-            toast(
-                if (ev.isEmpty()) "Left full screen by itself (nothing seen before or after)"
-                else "Left full screen. " + ev.joinToString("; ")
-            )
+            val text = if (ev.isEmpty()) "nothing seen before or after" else ev.joinToString("; ")
+            val stamp = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())
+            exitReports.add(0, "$stamp  $text")
+            while (exitReports.size > 6) exitReports.removeAt(exitReports.size - 1)
+            prefs.edit().putString("fs_exits", exitReports.joinToString("\u0001")).apply()
+            toast("Left full screen - details are in Tabs > Blocked log")
         }, 1300)
     }
 
@@ -705,6 +887,7 @@ class MainActivity : Activity() {
             }
         }
         activePageUrl = tab.pageUrl
+        injectNav(tab)
         web.requestFocus()
         if (!urlBar.hasFocus()) urlBar.setText(if (isHome(tab.pageUrl)) "" else tab.pageUrl)
         progress.visibility = View.GONE
@@ -895,6 +1078,7 @@ class MainActivity : Activity() {
         }
         prefs.edit().putInt("mode", AdBlock.mode.ordinal).apply()
         trail("shield mode " + AdBlock.mode.name)
+        for (t in tabs) applyCookiePolicy(t.web, t.pageUrl)
         AdBlock.resetFailure(applicationContext)
         AdBlock.ensureLoaded(applicationContext, ::status)
         toast("Shield: " + AdBlock.mode.name.lowercase())
@@ -977,6 +1161,12 @@ class MainActivity : Activity() {
                     hidePanel(); web.reload()
                 }))
         }
+        rows.add(Row("Navigation: " + (if (navMode) "Focus (jump between buttons)" else "Pointer (free cursor)"),
+            "Tap to switch. Shortcuts: press OK three times quickly, or the blue key, or the Pointer/Focus button.",
+            { hidePanel(); toggleNavMode() }))
+        rows.add(Row("Triple-OK shortcut: " + (if (prefs.getBoolean("triple_ok", true)) "ON" else "OFF"),
+            "Turn it off if you click the same button several times quickly and it switches modes by accident.",
+            { prefs.edit().putBoolean("triple_ok", !prefs.getBoolean("triple_ok", true)).apply(); showTabs() }))
         rows.add(Row("Remote key test", "See which keys and timing your remote sends", { hidePanel(); showKeyTest() }))
         rows.add(Row("Remote timing: " + (if (relaxed) "Relaxed" else "Standard"),
             "Relaxed suits TV remotes that deliver keys late (Samsung, HDMI-CEC). Tap to switch.",
@@ -992,6 +1182,10 @@ class MainActivity : Activity() {
             if (tab.docStart) "Page script runs on every frame" else "Page script runs on the main page only (old WebView)", { })
         val rows = ArrayList<Row>()
         rows.add(head)
+        rows.add(Row("Shield " + AdBlock.mode.name.lowercase() + ", third-party cookies " +
+            (if (cookiesFor(tab.pageUrl)) "on" else "off") + (if (isCompatSite(tab.pageUrl)) ", YouTube: filters not applied" else ""),
+            "Settings in effect for this page", { }))
+        for (r in exitReports) rows.add(Row("Full screen ended: $r", "", { }))
         if (items.isEmpty()) rows.add(Row("Nothing blocked yet", "Blocks show up here as you browse", { }))
         else for (it in items) rows.add(Row(it, "", { }))
         showPanel("Blocked log (newest first)", rows)
@@ -1034,6 +1228,8 @@ class MainActivity : Activity() {
         gravity = Gravity.CENTER
         setPadding(dp(16), dp(8), dp(16), dp(8))
         isClickable = true
+        isFocusable = true
+        setOnFocusChangeListener { v, f -> v.setBackgroundColor(if (f) 0xFF4A78C2.toInt() else 0xFF3C4043.toInt()) }
         setOnClickListener { onClick() }
     }
 
@@ -1047,11 +1243,13 @@ class MainActivity : Activity() {
         val texts = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             isClickable = true
+            isFocusable = true
+            setOnFocusChangeListener { _, f -> row.setBackgroundColor(if (f) 0xFF4A78C2.toInt() else 0xFF2A2B2F.toInt()) }
             setOnClickListener { r.onClick() }
         }
         texts.addView(TextView(this).apply {
             text = r.title; textSize = 18f; setTextColor(Color.WHITE)
-            setSingleLine(true); ellipsize = TextUtils.TruncateAt.END
+            maxLines = 3; ellipsize = TextUtils.TruncateAt.END
         })
         texts.addView(TextView(this).apply {
             text = r.sub; textSize = 13f; setTextColor(0xFF9AA0A6.toInt())
@@ -1086,6 +1284,7 @@ class MainActivity : Activity() {
         panelScroll = sv
         root.addView(col, FrameLayout.LayoutParams(MATCH, MATCH))
         cursor.bringToFront()
+        if (navMode) { clearToolbarFocus(); ui.post { col.requestFocus() } }   // focus mode: the first row gets the highlight
     }
 
     private fun hidePanel() {
@@ -1102,7 +1301,7 @@ class MainActivity : Activity() {
         customCallback?.onCustomViewHidden()
         customCallback = null
         ui.removeCallbacks(hideCursorRun)
-        cursor.visibility = if (scrollMode) View.INVISIBLE else View.VISIBLE
+        cursor.visibility = if (scrollMode) View.INVISIBLE else if (navMode) View.GONE else View.VISIBLE
         try { web.requestFocus() } catch (e: Exception) { }
     }
 
@@ -1190,6 +1389,13 @@ class MainActivity : Activity() {
         val down = e.action == KeyEvent.ACTION_DOWN
         detectRemote(e)
 
+        // Focus mode: arrows jump between buttons / cards / inputs (or the toolbar, or panel rows) instead of a pointer.
+        if (navMode && customView == null && !scrollMode) {
+            if (panel != null) {
+                if (e.keyCode in KeyEvent.KEYCODE_DPAD_UP..KeyEvent.KEYCODE_DPAD_CENTER) return super.dispatchKeyEvent(e)
+            } else if (handleFocusKeys(e, down)) return true
+        }
+
         val idx = when (e.keyCode) {
             KeyEvent.KEYCODE_DPAD_UP -> 0
             KeyEvent.KEYCODE_DPAD_DOWN -> 1
@@ -1241,11 +1447,7 @@ class MainActivity : Activity() {
                 } else {
                     okHeld = false
                     ui.removeCallbacks(okLongRun)
-                    if (!okLong) {
-                        if (scrollMode) toggleScrollMode()
-                        else if (customView != null && cursor.visibility != View.VISIBLE) pokeCursor()   // first OK only shows the pointer
-                        else clickAtCursor()
-                    }
+                    if (!okLong) onOkRelease()
                 }
                 return true
             }
@@ -1254,7 +1456,7 @@ class MainActivity : Activity() {
             KeyEvent.KEYCODE_PROG_RED -> { if (down && e.repeatCount == 0) toggleScrollMode(); return true }
             KeyEvent.KEYCODE_PROG_GREEN -> { if (down && e.repeatCount == 0) showFavs(); return true }
             KeyEvent.KEYCODE_PROG_YELLOW -> { if (down && e.repeatCount == 0) showTabs(); return true }
-            KeyEvent.KEYCODE_PROG_BLUE -> { if (down && e.repeatCount == 0) { jumpToToolbar(); pokeCursor() }; return true }
+            KeyEvent.KEYCODE_PROG_BLUE -> { if (down && e.repeatCount == 0) toggleNavMode(); return true }
             // Media keys: play/pause and seek the video.
             KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_MEDIA_PLAY, KeyEvent.KEYCODE_MEDIA_PAUSE ->
                 { if (down && e.repeatCount == 0) toggleVideo(); return true }
@@ -1264,6 +1466,169 @@ class MainActivity : Activity() {
             KeyEvent.KEYCODE_CHANNEL_DOWN -> { if (down) web.pageDown(false); return true }
         }
         return super.dispatchKeyEvent(e)
+    }
+
+    // ------------------------------------------------------------------ focus ("magnetic") navigation
+
+    private fun updateNavButton() { btnNav.text = if (navMode) "Focus" else "Pointer" }
+
+    private fun toggleNavMode() {
+        navMode = !navMode
+        prefs.edit().putBoolean("nav_focus", navMode).apply()
+        trail("navigation mode " + (if (navMode) "focus" else "pointer"))
+        clearToolbarFocus()
+        updateNavButton()
+        if (customView == null) cursor.visibility = if (navMode) View.GONE else if (scrollMode) View.INVISIBLE else View.VISIBLE
+        if (navMode) {
+            injectNav(tab)
+            toast("Focus navigation: arrows jump between buttons. OK x3 or the blue key switches back.")
+        } else {
+            try { web.evaluateJavascript("window.__tvbNav&&window.__tvbNav('off')", null) } catch (e: Exception) { }
+            toast("Pointer mode")
+        }
+    }
+
+    private fun injectNav(t: Tab) {
+        if (!navMode) return
+        try { t.web.evaluateJavascript(NAV_JS, null) } catch (e: Exception) { }
+    }
+
+    /** One OK press has been released: click now, but wait a moment after a second quick press so a third can switch modes. */
+    private fun onOkRelease() {
+        if (customView != null || panel != null || !prefs.getBoolean("triple_ok", true)) { performOk(); return }
+        val now = SystemClock.uptimeMillis()
+        val window = if (relaxed) 700L else 450L
+        if (now - lastOkUp > window) okCount = 0
+        lastOkUp = now
+        okCount++
+        pendingOk?.let { ui.removeCallbacks(it); pendingOk = null }
+        when {
+            okCount >= 3 -> { okCount = 0; toggleNavMode() }
+            okCount == 1 -> performOk()
+            else -> {
+                val r = Runnable { pendingOk = null; performOk() }
+                pendingOk = r
+                ui.postDelayed(r, window)
+            }
+        }
+    }
+
+    private fun performOk() {
+        when {
+            scrollMode -> toggleScrollMode()
+            customView != null && cursor.visibility != View.VISIBLE -> pokeCursor()   // first OK only shows the pointer
+            toolbarFocus >= 0 -> activateToolbarItem()
+            navMode && customView == null -> navOk()
+            else -> clickAtCursor()
+        }
+    }
+
+    private fun handleFocusKeys(e: KeyEvent, down: Boolean): Boolean {
+        val dir = when (e.keyCode) {
+            KeyEvent.KEYCODE_DPAD_UP -> "up"
+            KeyEvent.KEYCODE_DPAD_DOWN -> "down"
+            KeyEvent.KEYCODE_DPAD_LEFT -> "left"
+            KeyEvent.KEYCODE_DPAD_RIGHT -> "right"
+            else -> null
+        }
+        if (dir != null) {
+            if (down) {
+                val now = SystemClock.uptimeMillis()
+                if (now - lastNavAt >= 110) { lastNavAt = now; focusMove(dir) }
+            }
+            return true
+        }
+        if (e.keyCode == KeyEvent.KEYCODE_DPAD_CENTER || e.keyCode == KeyEvent.KEYCODE_ENTER || e.keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER) {
+            if (down) {
+                val now = SystemClock.uptimeMillis()
+                val repeatLike = e.repeatCount > 0 || (okHeld && now - lastOkDown < 450)
+                lastOkDown = now
+                if (!repeatLike) { okHeld = true; okLong = false; ui.removeCallbacks(okLongRun) }
+            } else {
+                okHeld = false
+                onOkRelease()
+            }
+            return true
+        }
+        return false
+    }
+
+    private fun focusMove(dir: String) {
+        if (toolbarFocus >= 0) {
+            when (dir) {
+                "left" -> setToolbarFocus((toolbarFocus - 1).coerceAtLeast(0))
+                "right" -> setToolbarFocus((toolbarFocus + 1).coerceAtMost(toolbarItems.size - 1))
+                "down" -> { clearToolbarFocus(); try { web.requestFocus() } catch (e: Exception) { } }
+            }
+            return
+        }
+        web.evaluateJavascript("window.__tvbNav?window.__tvbNav('$dir'):'nojs'") { raw ->
+            when ((raw ?: "").trim('"')) {
+                "nojs", "null" -> { injectNav(tab); ui.postDelayed({ focusMoveRetry(dir) }, 60) }
+                "edge" -> if (dir == "up") setToolbarFocus(4)          // nothing above and the page is at the top: the toolbar
+            }
+        }
+    }
+
+    private fun focusMoveRetry(dir: String) {
+        web.evaluateJavascript("window.__tvbNav?window.__tvbNav('$dir'):'nojs'") { raw ->
+            if ((raw ?: "").trim('"') == "edge" && dir == "up") setToolbarFocus(4)
+        }
+    }
+
+    private fun navOk() {
+        val w = web
+        w.evaluateJavascript("window.__tvbNav?window.__tvbNav('ok'):'nojs'") { raw ->
+            val parts = (raw ?: "").trim('"').split('|')
+            if (parts.size < 4) return@evaluateJavascript
+            val cx = parts[1].toFloatOrNull() ?: return@evaluateJavascript
+            val cy = parts[2].toFloatOrNull() ?: return@evaluateJavascript
+            val cw = parts[3].toFloatOrNull() ?: return@evaluateJavascript
+            if (cw <= 0f) return@evaluateJavascript
+            val k = w.width.toFloat() / cw                       // CSS pixels -> screen pixels
+            val wl = IntArray(2)
+            val rl = IntArray(2)
+            w.getLocationInWindow(wl)
+            root.getLocationInWindow(rl)
+            val px = wl[0] - rl[0] + cx * k
+            val py = wl[1] - rl[1] + cy * k
+            if (parts[0] == "iframe" || parts[0] == "video") {
+                // Players live in frames the page script can't see into: hand over to the pointer, placed on the player.
+                navMode = false
+                prefs.edit().putBoolean("nav_focus", false).apply()
+                updateNavButton()
+                cursorX = px
+                cursorY = py
+                cursor.setPos(cursorX, cursorY)
+                cursor.visibility = View.VISIBLE
+                try { w.evaluateJavascript("window.__tvbNav&&window.__tvbNav('off')", null) } catch (e: Exception) { }
+                tapAt(px, py)
+                toast("Pointer mode (needed for the player). OK x3 returns to focus navigation.")
+            } else tapAt(px, py)
+        }
+    }
+
+    private fun setToolbarFocus(i: Int) {
+        clearToolbarFocus()
+        toolbarFocus = i
+        val v = toolbarItems[i]
+        if (!toolbarBg.containsKey(v)) toolbarBg[v] = v.background
+        v.setBackgroundColor(0xFF4A78C2.toInt())
+    }
+
+    private fun clearToolbarFocus() {
+        if (toolbarFocus < 0) return
+        val v = toolbarItems[toolbarFocus]
+        v.background = toolbarBg[v]
+        toolbarFocus = -1
+    }
+
+    private fun activateToolbarItem() {
+        val i = toolbarFocus
+        if (i < 0) return
+        val v = toolbarItems[i]
+        clearToolbarFocus()
+        if (v === urlBar) urlBar.requestFocus() else v.performClick()
     }
 
     private fun toggleVideo() {
@@ -1292,6 +1657,7 @@ class MainActivity : Activity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
+        if (customView != null) trace(if (hasFocus) "app window focus back" else "app window lost focus")
         if (!hasFocus) held.fill(false)
     }
 
@@ -1407,8 +1773,12 @@ class MainActivity : Activity() {
 
     private fun clickAtCursor() {
         if (customView != null) pokeCursor()
-        val x = cursorX
-        val y = cursorY
+        tapAt(cursorX, cursorY)
+    }
+
+    /** A real touch tap at a point of the screen (root coordinates): trusted by pages, opens selects and keyboards. */
+    private fun tapAt(x: Float, y: Float) {
+        if (customView != null) trace("tap")
         val t = SystemClock.uptimeMillis()
         lastTap = t
         tapHref = ""
@@ -1459,6 +1829,7 @@ class MainActivity : Activity() {
     override fun onBackPressed() {
         if (customView != null) { userExit = true; hideCustom(); userExit = false; return }
         if (panel != null) { hidePanel(); return }
+        if (toolbarFocus >= 0) { clearToolbarFocus(); return }
         if (urlBar.hasFocus()) { hideKeyboard(); web.requestFocus(); return }
         if (scrollMode) { toggleScrollMode(); return }
         // Two quick Back presses open the exit popup.

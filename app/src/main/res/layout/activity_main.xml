@@ -45,9 +45,10 @@
                 android:imeOptions="actionGo" />
 
             <TextView android:id="@+id/btnTabs" style="@style/TbBtn" android:text="Tabs (1)" />
-            <TextView android:id="@+id/btnFavs" style="@style/TbBtn" android:text="Favorites" />
+            <TextView android:id="@+id/btnFavs" style="@style/TbBtn" android:text="Favs" />
             <TextView android:id="@+id/btnFav" style="@style/TbBtn" android:text="+ Fav" />
             <TextView android:id="@+id/btnShield" style="@style/TbBtn" android:text="Shield" />
+            <TextView android:id="@+id/btnNav" style="@style/TbBtn" android:text="Pointer" />
         </LinearLayout>
 
         <ProgressBar

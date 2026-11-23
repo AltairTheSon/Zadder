@@ -83,9 +83,10 @@ object AdBlock {
 
     fun note(reason: String, url: String, type: String = "") {
         val host = hostOf(url) ?: url.take(40)
+        val path = try { (Uri.parse(url).path ?: "").take(28) } catch (e: Exception) { "" }
         synchronized(blockLog) {
-            blockLog.addFirst(reason + "  " + host + (if (type.isNotEmpty()) "  (" + type + ")" else ""))
-            while (blockLog.size > 80) blockLog.removeLast()
+            blockLog.addFirst(reason + "  " + host + path + (if (type.isNotEmpty()) "  (" + type + ")" else ""))
+            while (blockLog.size > 150) blockLog.removeLast()
         }
     }
 
