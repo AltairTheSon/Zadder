@@ -257,6 +257,35 @@ private const val PAGE_JS = """
  window.alert=function(){ if(!off()&&inFs()){noteFs('alert() refused');return;} return _al.apply(this,arguments); };
  window.confirm=function(){ if(!off()&&inFs()){noteFs('confirm() refused');return false;} return _co.apply(this,arguments); };
  window.prompt=function(){ if(!off()&&inFs()){noteFs('prompt() refused');return null;} return _pr.apply(this,arguments); };
+ function h264(){ try{ return TVB.h264Only(); }catch(x){ return false; } }
+ var BAD=/av01|vp09|vp9|hev1|hvc1|dvh1|dvhe/i;
+ try{ if(window.MediaSource&&MediaSource.isTypeSupported){ var _its=MediaSource.isTypeSupported.bind(MediaSource); MediaSource.isTypeSupported=function(t){ if(h264()&&BAD.test(String(t)))return false; return _its(t); }; } }catch(x){}
+ try{ var _cpt=HTMLMediaElement.prototype.canPlayType; HTMLMediaElement.prototype.canPlayType=function(t){ if(h264()&&BAD.test(String(t)))return ''; return _cpt.call(this,t); }; }catch(x){}
+ var seekTot=0,togSeen=0,poll=0;
+ function pickVideo(){
+  var l=document.getElementsByTagName('video'),b=null,ba=-1,i,v,r,a;
+  for(i=0;i<l.length;i++){v=l[i];r=v.getBoundingClientRect();a=r.width*r.height+((!v.paused&&!v.ended)?1e9:0);if(a>ba){ba=a;b=v;}}
+  return b;
+ }
+ function doSeek(d){
+  var v=pickVideo();if(!v)return;
+  var dur=v.duration,t=v.currentTime+d;
+  v.currentTime=(isFinite(dur)&&dur>0)?Math.max(0,Math.min(dur-0.3,t)):Math.max(0,t);
+ }
+ function tick(){
+  var t,c;
+  try{t=TVB.seekTotal();c=TVB.toggleCount();}catch(x){return;}
+  if(t!==seekTot){var d=t-seekTot;seekTot=t;doSeek(d);}
+  if(c!==togSeen){togSeen=c;var v=pickVideo();if(v){if(v.paused){var p=v.play();if(p&&p.catch)p.catch(function(){});}else v.pause();}}
+ }
+ function anyPlaying(){var l=document.getElementsByTagName('video'),i;for(i=0;i<l.length;i++)if(!l[i].paused&&!l[i].ended)return true;return false;}
+ function fsOn(){return !!(document.fullscreenElement||document.webkitFullscreenElement);}
+ function startPoll(){if(poll)return;try{seekTot=TVB.seekTotal();togSeen=TVB.toggleCount();}catch(x){}poll=setInterval(tick,200);}
+ function stopPoll(){if(!poll)return;clearInterval(poll);poll=0;}
+ function recheck(){if(anyPlaying()||fsOn())startPoll();else stopPoll();}
+ ['play','playing','pause','ended','emptied'].forEach(function(n){document.addEventListener(n,function(){setTimeout(recheck,50);},true);});
+ document.addEventListener('fullscreenchange',recheck,true);document.addEventListener('webkitfullscreenchange',recheck,true);
+ try{ if(navigator.mediaCapabilities&&navigator.mediaCapabilities.decodingInfo){ var _di=navigator.mediaCapabilities.decodingInfo.bind(navigator.mediaCapabilities); navigator.mediaCapabilities.decodingInfo=function(c){ try{ var ct=(c&&c.video&&c.video.contentType)||''; if(h264()&&BAD.test(ct))return Promise.resolve({supported:false,smooth:false,powerEfficient:false}); }catch(x){} return _di(c); }; } }catch(x){}
 })();
 """
 
@@ -347,6 +376,16 @@ class MainActivity : Activity() {
     private var promptShowing = false
     private var safeMode = false
 
+    // seeking the video from the remote
+    @Volatile private var seekSum = 0
+    @Volatile private var toggleSum = 0
+    @Volatile private var lastVideoPing = 0L
+    private val videoActive: Boolean get() = SystemClock.uptimeMillis() - lastVideoPing < 800
+    private val seekStep: Int get() = prefs.getInt("seek_step", 10)
+    private lateinit var seekHud: TextView
+    private var seekHudSum = 0
+    private val hideHudRun = Runnable { seekHud.visibility = View.GONE; seekHudSum = 0 }
+
     // navigation mode: pointer (free cursor) or focus (jump from button to card to input, like a TV app)
     private var navMode = false
     private var toolbarFocus = -1
@@ -399,6 +438,16 @@ class MainActivity : Activity() {
         @JavascriptInterface
         fun siteOff(): Boolean = shieldOffFor(activePageUrl)
 
+        /** Frames with a playing / full screen video poll this; it doubles as their "I am here" signal. */
+        @JavascriptInterface
+        fun seekTotal(): Int { lastVideoPing = SystemClock.uptimeMillis(); return seekSum }
+
+        @JavascriptInterface
+        fun toggleCount(): Int = toggleSum
+
+        @JavascriptInterface
+        fun h264Only(): Boolean = prefs.getBoolean("h264_only", false)
+
         @JavascriptInterface
         fun noteFs(what: String?) { trace("page: " + (what ?: "?")) }
 
@@ -433,6 +482,7 @@ class MainActivity : Activity() {
 
     private val trailFile: File by lazy { File(filesDir, "trail.txt") }
     private var prevTrail = ""
+    private var prevHost: String? = null
     private var lastSyncAt = 0L
     private var wasClean = true
     private var tick = 0
@@ -469,14 +519,16 @@ class MainActivity : Activity() {
     private fun readPrevTrail() {
         try {
             if (trailFile.exists()) {
-                prevTrail = trailFile.readLines().takeLast(14).joinToString("\n")
+                val lines = trailFile.readLines()
+                prevTrail = lines.takeLast(14).joinToString("\n")
+                prevHost = lines.lastOrNull { Regex("^\\S+ page \\S+$").matches(it) }?.substringAfterLast(' ')
                 trailFile.delete()
             }
         } catch (e: Exception) { }
     }
 
     /** Embedded players (iframes from other sites) often need cookies; Aggressive keeps third-party cookies off. */
-    private fun cookiesFor(url: String): Boolean = !AdBlock.aggressive || shieldOffFor(url) || isCompatSite(url)
+    private fun cookiesFor(url: String): Boolean = prefs.getBoolean("third_party_cookies", true) || shieldOffFor(url) || isCompatSite(url)
 
     private fun applyCookiePolicy(w: WebView, url: String = "") {
         try { android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(w, cookiesFor(url)) } catch (e: Exception) { }
@@ -583,6 +635,15 @@ class MainActivity : Activity() {
 
         root = findViewById(R.id.root)
         webHolder = findViewById(R.id.webHolder)
+        seekHud = TextView(this).apply {
+            textSize = 30f
+            setTextColor(Color.WHITE)
+            setBackgroundColor(0xB0000000.toInt())
+            setPadding(dp(28), dp(14), dp(28), dp(14))
+            gravity = Gravity.CENTER
+            visibility = View.GONE
+        }
+        root.addView(seekHud, FrameLayout.LayoutParams(WRAP, WRAP, Gravity.CENTER))
         cursor = findViewById(R.id.cursor)
         toolbar = findViewById(R.id.toolbar)
         urlBar = findViewById(R.id.urlBar)
@@ -616,13 +677,16 @@ class MainActivity : Activity() {
         btnNav.setOnClickListener { toggleNavMode() }
         updateNavButton()
 
+        urlBar.isFocusable = false
+        urlBar.isFocusableInTouchMode = false
+        urlBar.setOnTouchListener { _, ev -> if (ev.action == MotionEvent.ACTION_DOWN) enableUrlFocus(); false }
         urlBar.setOnEditorActionListener { v, actionId, _ ->
             if (actionId == EditorInfo.IME_ACTION_GO || actionId == EditorInfo.IME_ACTION_DONE) {
                 load(v.text.toString()); hideKeyboard(); web.requestFocus(); true
             } else false
         }
         urlBar.setOnFocusChangeListener { _, focused ->
-            if (focused) ui.postDelayed({ imm().showSoftInput(urlBar, 0) }, 100)
+            if (focused) ui.postDelayed({ imm().showSoftInput(urlBar, 0) }, 100) else ui.post { disableUrlFocus() }
         }
 
         newTab(intent?.dataString ?: home)
@@ -690,9 +754,13 @@ class MainActivity : Activity() {
                 if (!url.startsWith("http")) return null
                 if (shieldOffFor(t.pageUrl) || isCompatSite(t.pageUrl)) return null   // YouTube: filters never touch playback
                 val source = t.pageUrl.ifEmpty { url }
-                return if (AdBlock.shouldBlock(url, source, guessType(request)))
-                    WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
-                else null
+                val type = guessType(request)
+                return if (AdBlock.shouldBlock(url, source, type)) {
+                    // Data requests (video segments, API calls) get a clean "forbidden"; scripts/images/styles get an empty body.
+                    if (type == "media" || type == "xmlhttprequest" || type == "other")
+                        WebResourceResponse("text/plain", "utf-8", 403, "Blocked", emptyMap(), ByteArrayInputStream(ByteArray(0)))
+                    else WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+                } else null
             }
 
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
@@ -732,8 +800,10 @@ class MainActivity : Activity() {
             }
 
             override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
-                trail("WebView process gone (crashed=" + (detail?.didCrash() ?: false) + ")")
-                ui.post { recoverTab(t) }
+                val crashed = detail?.didCrash() ?: false
+                trail("WebView process gone (crashed=$crashed)")
+                val failedUrl = t.pageUrl
+                ui.post { recoverTab(t, crashed); offerShieldOff(failedUrl) }
                 return true
             }
 
@@ -759,6 +829,8 @@ class MainActivity : Activity() {
                 trail("full screen ON")
                 root.addView(view, FrameLayout.LayoutParams(MATCH, MATCH))
                 cursor.bringToFront()
+                // While a video is full screen the page may not open windows at all.
+                try { web.settings.setSupportMultipleWindows(false) } catch (e: Exception) { }
                 // Full screen video: the pointer starts hidden, appears when you move it and hides again after 3 s.
                 held.fill(false)
                 ui.removeCallbacks(hideCursorRun)
@@ -771,8 +843,9 @@ class MainActivity : Activity() {
                 userExit = false
                 hideCustom()
                 if (!byUser) {
+                    reenterResult = "not tried"
                     reportFullscreenExit()
-                    ui.postDelayed({ tryReenterFullscreen() }, 300)
+                    ui.postDelayed({ tryReenterFullscreen(0) }, 250)
                 }
             }
 
@@ -830,6 +903,28 @@ class MainActivity : Activity() {
         }
     }
 
+    /** The page died: it may have been something the shield blocked. Offer the per-site switch. */
+    private fun offerShieldOff(url: String) {
+        if (isFinishing || promptShowing || AdBlock.mode == AdBlock.Mode.OFF || !url.startsWith("http") || isHome(url)) return
+        val d = baseDomain(url)
+        if (d.isEmpty() || shieldOffSites.contains(d)) return
+        promptShowing = true
+        val dlg = android.app.AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+            .setTitle("The page stopped working")
+            .setMessage("This can happen when the shield blocks something the page needs. Turn the shield off for $d and reload it?")
+            .setPositiveButton("Turn off for $d") { _, _ ->
+                shieldOffSites.add(d)
+                prefs.edit().putStringSet("site_off", HashSet(shieldOffSites)).apply()
+                trail("shield off for $d (offered after the page stopped)")
+                tab.chainOk = true
+                web.loadUrl(url)
+            }
+            .setNegativeButton("Not now", null)
+            .create()
+        dlg.setOnDismissListener { promptShowing = false }
+        dlg.show()
+    }
+
     private fun closePopupTab(t: Tab) {
         val i = tabs.indexOf(t)
         if (i >= 0 && tabs.size > 1) closeTab(i)
@@ -839,12 +934,20 @@ class MainActivity : Activity() {
     private var exitReports: MutableList<String> = ArrayList()
 
     /** A tap just before the exit gives the page permission to go full screen again: put the player back. */
-    private fun tryReenterFullscreen() {
+    private var reenterResult = "not tried"
+
+    private fun tryReenterFullscreen(attempt: Int) {
         val now = SystemClock.uptimeMillis()
-        if (customView != null || now - lastReenter < 10000 || now - lastTap > 4500) return
-        lastReenter = now
-        trail("trying to re-enter full screen")
+        if (customView != null) { if (attempt > 0) reenterResult = "worked"; return }
+        if (attempt == 0) {
+            if (now - lastReenter < 6000 || now - lastTap > 6000) return
+            lastReenter = now
+            reenterResult = "failed"
+        }
+        if (attempt > 2) return
+        trail("re-enter full screen attempt $attempt")
         try { web.evaluateJavascript("window.__tvbReenter&&window.__tvbReenter()", null) } catch (e: Exception) { }
+        ui.postDelayed({ tryReenterFullscreen(attempt + 1) }, 700)
     }
 
     /** Tells the user (and me) what happened around the moment a video left full screen on its own. */
@@ -852,16 +955,16 @@ class MainActivity : Activity() {
         val t0 = SystemClock.uptimeMillis()
         ui.postDelayed({
             val ev = synchronized(events) {
-                events.filter { it.first >= t0 - 2500 && it.first <= t0 + 1200 }
+                events.filter { it.first >= t0 - 2500 && it.first <= t0 + 2400 }
                     .map { (if (it.first < t0) "before: " else "after: ") + it.second }
             }
             val text = if (ev.isEmpty()) "nothing seen before or after" else ev.joinToString("; ")
             val stamp = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())
-            exitReports.add(0, "$stamp  $text")
+            exitReports.add(0, "$stamp  $text  [put back: $reenterResult]")
             while (exitReports.size > 6) exitReports.removeAt(exitReports.size - 1)
             prefs.edit().putString("fs_exits", exitReports.joinToString("\u0001")).apply()
             toast("Left full screen - details are in Tabs > Blocked log")
-        }, 1300)
+        }, 2600)
     }
 
     private fun newTab(url: String?, activate: Boolean = true): Tab {
@@ -913,7 +1016,7 @@ class MainActivity : Activity() {
     }
 
     /** The WebView's renderer process was killed (usually low memory): rebuild this tab instead of crashing. */
-    private fun recoverTab(t: Tab) {
+    private fun recoverTab(t: Tab, crashed: Boolean = false) {
         val i = tabs.indexOf(t)
         if (i < 0) return
         webHolder.removeView(t.web)
@@ -927,7 +1030,7 @@ class MainActivity : Activity() {
         w.visibility = if (i == cur) View.VISIBLE else View.GONE
         w.loadUrl(home)
         if (i == cur) w.requestFocus()
-        toast("The page ran out of memory and was reset")
+        toast(if (crashed) "The page crashed and was reset" else "The page was stopped by the system (low memory) and was reset")
     }
 
     private fun updateTabsLabel() { btnTabs.text = "Tabs (${tabs.size})" }
@@ -1167,6 +1270,19 @@ class MainActivity : Activity() {
         rows.add(Row("Triple-OK shortcut: " + (if (prefs.getBoolean("triple_ok", true)) "ON" else "OFF"),
             "Turn it off if you click the same button several times quickly and it switches modes by accident.",
             { prefs.edit().putBoolean("triple_ok", !prefs.getBoolean("triple_ok", true)).apply(); showTabs() }))
+        rows.add(Row("Third-party cookies: " + (if (prefs.getBoolean("third_party_cookies", true)) "ON" else "OFF"),
+            "Video players embedded in a page usually need them. Turn off for maximum privacy.",
+            {
+                prefs.edit().putBoolean("third_party_cookies", !prefs.getBoolean("third_party_cookies", true)).apply()
+                for (t in tabs) applyCookiePolicy(t.web, t.pageUrl)
+                showTabs()
+            }))
+        rows.add(Row("Seek step: " + seekStep + " seconds",
+            "In full screen: double-tap LEFT / RIGHT. Also the rewind / forward keys. Tap to change (5, 10, 15, 30).",
+            { val order = listOf(5, 10, 15, 30); prefs.edit().putInt("seek_step", order[(order.indexOf(seekStep) + 1) % order.size]).apply(); showTabs() }))
+        rows.add(Row("Video codecs: " + (if (prefs.getBoolean("h264_only", false)) "H.264 only" else "All"),
+            "Try H.264 only if the box restarts or freezes during some videos (some boxes crash on AV1/VP9/HEVC). Reloads the page.",
+            { prefs.edit().putBoolean("h264_only", !prefs.getBoolean("h264_only", false)).apply(); hidePanel(); web.reload() }))
         rows.add(Row("Remote key test", "See which keys and timing your remote sends", { hidePanel(); showKeyTest() }))
         rows.add(Row("Remote timing: " + (if (relaxed) "Relaxed" else "Standard"),
             "Relaxed suits TV remotes that deliver keys late (Samsung, HDMI-CEC). Tap to switch.",
@@ -1284,10 +1400,12 @@ class MainActivity : Activity() {
         panelScroll = sv
         root.addView(col, FrameLayout.LayoutParams(MATCH, MATCH))
         cursor.bringToFront()
+        (root.getChildAt(0) as? ViewGroup)?.descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS   // keep focus inside the panel
         if (navMode) { clearToolbarFocus(); ui.post { col.requestFocus() } }   // focus mode: the first row gets the highlight
     }
 
     private fun hidePanel() {
+        (root.getChildAt(0) as? ViewGroup)?.descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
         panel?.let { root.removeView(it) }
         panel = null
         panelScroll = null
@@ -1296,6 +1414,7 @@ class MainActivity : Activity() {
 
     private fun hideCustom() {
         trail("full screen OFF")
+        try { web.settings.setSupportMultipleWindows(true) } catch (e: Exception) { }
         customView?.let { root.removeView(it) }
         customView = null
         customCallback?.onCustomViewHidden()
@@ -1319,9 +1438,18 @@ class MainActivity : Activity() {
         web.loadUrl(url)
     }
 
-    private fun showInfo(title: String, text: String) {
-        android.app.AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
-            .setTitle(title).setMessage(text).setPositiveButton("OK", null).show()
+    private fun showInfo(title: String, text: String, offerHost: String? = null) {
+        val b = android.app.AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+            .setTitle(title).setMessage(text).setPositiveButton("OK", null)
+        val d = if (offerHost != null) baseDomain("https://$offerHost") else ""
+        if (d.isNotEmpty() && AdBlock.mode != AdBlock.Mode.OFF && !shieldOffSites.contains(d)) {
+            b.setNeutralButton("Shield OFF for $d") { _, _ ->
+                shieldOffSites.add(d)
+                prefs.edit().putStringSet("site_off", HashSet(shieldOffSites)).apply()
+                trail("shield off for $d (offered after a stop)")
+            }
+        }
+        b.show()
     }
 
     /** After a crash, a system kill or even a restart of the whole box, tell the user what we know. */
@@ -1360,7 +1488,7 @@ class MainActivity : Activity() {
             if (title == null) title = "The app or the TV box stopped unexpectedly"
             sb.append("\nLast events before it stopped:\n").append(prevTrail)
         }
-        if (title != null) showInfo(title, sb.toString().take(1600))
+        if (title != null) showInfo(title, sb.toString().take(1600), if (!wasClean) prevHost else null)
     }
 
     private fun status(msg: String) { runOnUiThread { toast(msg) } }
@@ -1414,16 +1542,17 @@ class MainActivity : Activity() {
                 if (!repeatLike) {
                     if (!held[idx]) heldSince[idx] = System.nanoTime()
                     held[idx] = true
-                    if (idx == 0) { if (now - lastUp in dtMin..dtMax && !scrollMode) jumpToToolbar(); lastUp = now }
-                    if (idx == 1) {
-                        // Double-tap DOWN while the first tap started in the toolbar: go back to where we were.
-                        if (now - lastDown in dtMin..dtMax && !scrollMode && downStartY <= toolbar.height) {
-                            returnFromToolbar(); downStartY = Float.MAX_VALUE
-                        } else downStartY = cursorY
-                        lastDown = now
+                    if (idx == 0) { if (now - lastUp in dtMin..dtMax && !scrollMode) jumpVertical(-1); lastUp = now }
+                    if (idx == 1) { if (now - lastDown in dtMin..dtMax && !scrollMode) jumpVertical(1); lastDown = now }
+                    // Full screen video: double-tap LEFT / RIGHT seeks back / forward (like double-tapping a phone player).
+                    if (idx == 2) {
+                        if (now - lastLeft in dtMin..dtMax && !scrollMode) { if (customView != null) requestSeek(-seekStep) else jumpHorizontal(-1) }
+                        lastLeft = now
                     }
-                    if (idx == 2) { if (now - lastLeft in dtMin..dtMax && !scrollMode) jumpHorizontal(-1); lastLeft = now }
-                    if (idx == 3) { if (now - lastRight in dtMin..dtMax && !scrollMode) jumpHorizontal(1); lastRight = now }
+                    if (idx == 3) {
+                        if (now - lastRight in dtMin..dtMax && !scrollMode) { if (customView != null) requestSeek(seekStep) else jumpHorizontal(1) }
+                        lastRight = now
+                    }
                     startLoop()
                 }
             } else held[idx] = false
@@ -1451,7 +1580,7 @@ class MainActivity : Activity() {
                 }
                 return true
             }
-            KeyEvent.KEYCODE_MENU, KeyEvent.KEYCODE_SEARCH, KeyEvent.KEYCODE_INFO -> { if (down && e.repeatCount == 0) urlBar.requestFocus(); return true }
+            KeyEvent.KEYCODE_MENU, KeyEvent.KEYCODE_SEARCH, KeyEvent.KEYCODE_INFO -> { if (down && e.repeatCount == 0) focusUrlBar(); return true }
             // Coloured keys: shortcuts for gestures that some remotes can't send.
             KeyEvent.KEYCODE_PROG_RED -> { if (down && e.repeatCount == 0) toggleScrollMode(); return true }
             KeyEvent.KEYCODE_PROG_GREEN -> { if (down && e.repeatCount == 0) showFavs(); return true }
@@ -1460,8 +1589,14 @@ class MainActivity : Activity() {
             // Media keys: play/pause and seek the video.
             KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_MEDIA_PLAY, KeyEvent.KEYCODE_MEDIA_PAUSE ->
                 { if (down && e.repeatCount == 0) toggleVideo(); return true }
-            KeyEvent.KEYCODE_MEDIA_REWIND -> { if (down) { if (customView != null) seekVideo(-10) else web.pageUp(false) }; return true }
-            KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> { if (down) { if (customView != null) seekVideo(10) else web.pageDown(false) }; return true }
+            KeyEvent.KEYCODE_MEDIA_REWIND -> {
+                if (down && (e.repeatCount == 0 || e.repeatCount % 6 == 0)) { if (customView != null || videoActive) requestSeek(-seekStep) else web.pageUp(false) }
+                return true
+            }
+            KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> {
+                if (down && (e.repeatCount == 0 || e.repeatCount % 6 == 0)) { if (customView != null || videoActive) requestSeek(seekStep) else web.pageDown(false) }
+                return true
+            }
             KeyEvent.KEYCODE_CHANNEL_UP -> { if (down) web.pageUp(false); return true }
             KeyEvent.KEYCODE_CHANNEL_DOWN -> { if (down) web.pageDown(false); return true }
         }
@@ -1469,6 +1604,10 @@ class MainActivity : Activity() {
     }
 
     // ------------------------------------------------------------------ focus ("magnetic") navigation
+
+    private fun enableUrlFocus() { urlBar.isFocusable = true; urlBar.isFocusableInTouchMode = true }
+    private fun disableUrlFocus() { urlBar.isFocusable = false; urlBar.isFocusableInTouchMode = false }
+    private fun focusUrlBar() { enableUrlFocus(); urlBar.requestFocus() }
 
     private fun updateNavButton() { btnNav.text = if (navMode) "Focus" else "Pointer" }
 
@@ -1481,7 +1620,7 @@ class MainActivity : Activity() {
         if (customView == null) cursor.visibility = if (navMode) View.GONE else if (scrollMode) View.INVISIBLE else View.VISIBLE
         if (navMode) {
             injectNav(tab)
-            toast("Focus navigation: arrows jump between buttons. OK x3 or the blue key switches back.")
+            toast("Focus navigation on. Switch back with OK three times, the Pointer/Focus button, or the blue button if your remote has one.")
         } else {
             try { web.evaluateJavascript("window.__tvbNav&&window.__tvbNav('off')", null) } catch (e: Exception) { }
             toast("Pointer mode")
@@ -1628,16 +1767,37 @@ class MainActivity : Activity() {
         if (i < 0) return
         val v = toolbarItems[i]
         clearToolbarFocus()
-        if (v === urlBar) urlBar.requestFocus() else v.performClick()
+        if (v === urlBar) focusUrlBar() else v.performClick()
+    }
+
+    /** Seek the video by [sec] seconds (negative = back), in whichever frame the player lives. */
+    private fun requestSeek(sec: Int) {
+        if (isCompatSite(tab.pageUrl)) {
+            sendKeyToPage(if (sec < 0) KeyEvent.KEYCODE_J else KeyEvent.KEYCODE_L)   // YouTube's own shortcuts (10 s)
+        } else {
+            seekSum += sec
+        }
+        showSeekHud(sec)
+    }
+
+    private fun showSeekHud(sec: Int) {
+        seekHudSum += sec
+        seekHud.text = (if (seekHudSum >= 0) "+" else "-") + Math.abs(seekHudSum) + " s"
+        seekHud.visibility = View.VISIBLE
+        seekHud.bringToFront()
+        ui.removeCallbacks(hideHudRun)
+        ui.postDelayed(hideHudRun, 900)
     }
 
     private fun toggleVideo() {
+        if (videoActive) { toggleSum++; return }       // a frame with the player is listening
+
         web.evaluateJavascript(
             "(function(){var v=document.querySelector('video');if(!v)return 0;if(v.paused)v.play();else v.pause();return 1})()"
         ) { r -> if (r != "1") sendKeyToPage(KeyEvent.KEYCODE_SPACE) }
     }
 
-    private fun seekVideo(sec: Int) {
+    private fun seekVideoOld(sec: Int) {
         web.evaluateJavascript(
             "(function(){var v=document.querySelector('video');if(v&&isFinite(v.duration)){v.currentTime=Math.max(0,v.currentTime+(${sec}));}})()", null
         )
@@ -1714,6 +1874,8 @@ class MainActivity : Activity() {
         cursorX = nx.coerceIn(0f, w - 1f)
         cursorY = ny.coerceIn(0f, h - 1f)
         if (edgeJump != 0 && cursorX > 120 * density && cursorX < w - 120 * density) edgeJump = 0
+        if (vJump == -1 && cursorY > toolbar.height + 120 * density) vJump = 0
+        if (vJump == 1 && cursorY < h - 120 * density) vJump = 0
         cursor.setPos(cursorX, cursorY)
     }
 
@@ -1754,6 +1916,24 @@ class MainActivity : Activity() {
             if (edgeJump == 0) savedX = cursorX
             cursorX = if (dir < 0) 10 * density else w - 1f - 10 * density
             edgeJump = dir
+        }
+        cursor.setPos(cursorX, cursorY)
+    }
+
+    private var vJump = 0          // -1: pointer was jumped to the toolbar (top), 1: to the bottom edge
+
+    /** Double-tap UP: to the toolbar. Double-tap DOWN: to the bottom edge. The opposite double-tap brings it back. */
+    private fun jumpVertical(dir: Int) {
+        if (panel != null) return
+        val h = root.height.toFloat()
+        if (h <= 0f) return
+        if (vJump == -dir) {
+            cursorY = if (savedY > 0f) savedY else h / 2f
+            vJump = 0
+        } else {
+            if (vJump == 0) savedY = cursorY
+            cursorY = if (dir < 0) toolbar.height / 2f else h - 1f - 10 * density
+            vJump = dir
         }
         cursor.setPos(cursorX, cursorY)
     }
